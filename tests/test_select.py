@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from pyanglemania.preprocessing._select import (
+    extract_unique_genes,
+    prefilter_gene_pairs,
+    rank_gene_pairs,
+)
+
+
+def _toy_matrices():
+    genes = ["g1", "g2", "g3"]
+    # upper triangle: (g1,g2) mean=3.0 sd=0.3 sn=10; (g1,g3) mean=0.2 sd=0.5 sn=0.4;
+    # (g2,g3) mean=0.1 sd=0.5 sn=0.2 -- only (g1,g2) clears a threshold of 1.0.
+    mean = np.array(
+        [
+            [0.0, 3.0, 0.2],
+            [3.0, 0.0, 0.1],
+            [0.2, 0.1, 0.0],
+        ]
+    )
+    sd = np.array(
+        [
+            [np.nan, 0.3, 0.5],
+            [0.3, np.nan, 0.5],
+            [0.5, 0.5, np.nan],
+        ]
+    )
+    sn = np.abs(mean) / sd
+    return genes, mean, sd, sn
+
+
+def test_prefilter_gene_pairs_basic_threshold():
+    _, mean, sd, sn = _toy_matrices()
+    df = prefilter_gene_pairs(
+        mean, sd, sn, zscore_mean_threshold=1.0, zscore_sn_threshold=1.0, verbose=False
+    )
+    # g1=0, g2=1, g3=2
+    assert list(zip(df["geneA_idx"], df["geneB_idx"])) == [(0, 1)]
+
+
+def test_prefilter_gene_pairs_rejects_nonpositive_threshold():
+    _, mean, sd, sn = _toy_matrices()
+    with pytest.raises(ValueError):
+        prefilter_gene_pairs(
+            mean, sd, sn, zscore_mean_threshold=0, zscore_sn_threshold=1, verbose=False
+        )
+
+
+def test_prefilter_gene_pairs_relaxes_threshold_until_a_pair_passes():
+    _, mean, sd, sn = _toy_matrices()
+    # Nothing clears 3.05/3.05 (max mean is exactly 3.0); one relaxation
+    # step down to 2.95/2.95 should let (g1, g2) through.
+    df = prefilter_gene_pairs(
+        mean,
+        sd,
+        sn,
+        zscore_mean_threshold=3.05,
+        zscore_sn_threshold=3.05,
+        verbose=False,
+    )
+    assert list(zip(df["geneA_idx"], df["geneB_idx"])) == [(0, 1)]
+
+
+def test_rank_gene_pairs_both_direction_favors_large_abs_mean_and_small_sd():
+    df = pd.DataFrame(
+        {
+            "geneA": ["a", "c"],
+            "geneB": ["b", "d"],
+            "mean_zscore": [3.0, -3.0],
+            "sd_zscore": [0.1, 0.5],
+            "sn_zscore": [30.0, 6.0],
+        }
+    )
+    ranked = rank_gene_pairs(df, score_weights=(0.4, 0.6), direction="both")
+    assert ranked.iloc[0]["geneA"] == "a"
+
+
+def test_rank_gene_pairs_cor_direction_prefers_positive_mean():
+    df = pd.DataFrame(
+        {
+            "geneA": ["a", "c"],
+            "geneB": ["b", "d"],
+            "mean_zscore": [3.0, -3.0],
+            "sd_zscore": [0.2, 0.2],
+            "sn_zscore": [15.0, 15.0],
+        }
+    )
+    ranked = rank_gene_pairs(df, direction="cor")
+    assert ranked.iloc[0]["geneA"] == "a"
+
+
+def test_rank_gene_pairs_anticor_direction_prefers_negative_mean():
+    df = pd.DataFrame(
+        {
+            "geneA": ["a", "c"],
+            "geneB": ["b", "d"],
+            "mean_zscore": [3.0, -3.0],
+            "sd_zscore": [0.2, 0.2],
+            "sn_zscore": [15.0, 15.0],
+        }
+    )
+    ranked = rank_gene_pairs(df, direction="anticor")
+    assert ranked.iloc[0]["geneA"] == "c"
+
+
+def test_rank_gene_pairs_direction_validation():
+    df = pd.DataFrame(
+        {"geneA": ["a"], "geneB": ["b"], "mean_zscore": [1.0], "sd_zscore": [0.1], "sn_zscore": [10.0]}
+    )
+    with pytest.raises(ValueError):
+        rank_gene_pairs(df, direction="bogus")
+
+
+def test_extract_unique_genes_preserves_rank_order_and_caps():
+    gene_names = ["a", "b", "c", "d", "e", "f"]
+    # rank order: (a,b), (c,a), (e,f) -- by index: (0,1), (2,0), (4,5)
+    ranked = pd.DataFrame({"geneA_idx": [0, 2, 4], "geneB_idx": [1, 0, 5]})
+    genes = extract_unique_genes(ranked, gene_names, max_n_genes=4)
+    assert genes == ["a", "b", "c", "e"]
+
+
+def test_extract_unique_genes_no_cap():
+    gene_names = ["a", "b", "c"]
+    ranked = pd.DataFrame({"geneA_idx": [0, 2], "geneB_idx": [1, 0]})
+    genes = extract_unique_genes(ranked, gene_names, max_n_genes=None)
+    assert genes == ["a", "b", "c"]
+
+
+def test_extract_unique_genes_matches_full_dedup_when_growth_is_needed():
+    # The first 50 rows are all the same pair (no new genes), so the
+    # initial prefix guess (== max_n_genes == 3) won't have 3 unique genes
+    # yet and the exponential-growth loop has to kick in to find them.
+    gene_names = ["dup_a", "dup_b", "c", "d", "e", "f", "g", "h"]
+    rows = [(0, 1)] * 50 + [(2, 3), (4, 5), (6, 7)]
+    ranked = pd.DataFrame(rows, columns=["geneA_idx", "geneB_idx"])
+
+    got = extract_unique_genes(ranked, gene_names, max_n_genes=3)
+
+    # Reference: dedup the whole table up front (the pre-optimization
+    # behavior), then truncate -- must match exactly.
+    interleaved = np.ravel(ranked[["geneA_idx", "geneB_idx"]].to_numpy())
+    _, first_seen = np.unique(interleaved, return_index=True)
+    expected = list(np.asarray(gene_names)[interleaved[np.sort(first_seen)][:3]])
+
+    assert got == expected == ["dup_a", "dup_b", "c"]
+
+
+def test_extract_unique_genes_fewer_unique_than_requested():
+    gene_names = ["a", "b"]
+    ranked = pd.DataFrame({"geneA_idx": [0, 0], "geneB_idx": [1, 1]})
+    genes = extract_unique_genes(ranked, gene_names, max_n_genes=10)
+    assert genes == ["a", "b"]

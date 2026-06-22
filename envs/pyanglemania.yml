@@ -1,0 +1,21 @@
+name: pyanglemania
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - pip
+  - scanpy
+  - python-igraph
+  - leidenalg
+  - scvi-tools
+  - harmonypy
+  - anndata
+  - pytest
+  - ruff
+  - hatchling
+  - ipykernel
+  - nbconvert
+  - cuda-cudart-dev=12.9
+  - pip:
+      - cupy-cuda12x
