@@ -21,7 +21,7 @@ def prefilter_gene_pairs(
     zscore_mean_threshold: float = 0.5,
     zscore_sn_threshold: float = 0.5,
     verbose: bool = True,
-) -> pd.DataFrame:
+) -> dict:
     """Keep gene pairs whose |mean z-score| and SNR both clear a threshold.
 
     Ports ``prefilter_angl``/``select_genes_cpp``: only the upper triangle
@@ -31,15 +31,19 @@ def prefilter_gene_pairs(
 
     The upper-triangle gather and threshold mask run on whichever array
     module backs ``mean_zscore`` (numpy or cupy); only the pairs that
-    survive filtering are ever pulled to the host, instead of transferring
-    the full (genes x genes) matrices before filtering (see
-    plans/optimization.md #1). Genes stay as integer indices
-    (``geneA_idx``/``geneB_idx``) rather than name strings here -- like R's
-    own ``select_genes_cpp``, which maps indices to gene names only at the
-    very end (``select_genes.R``) -- so ``rank_gene_pairs``'s sort never
-    has to drag string columns along (plans/optimization.md #6); callers
-    map back to names once, after ranking, for the handful of rows that
-    matter.
+    survive filtering are ever computed at all, instead of building the
+    full (genes x genes) pairs table before filtering (see
+    plans/optimization.md #1). Returns a dict of arrays in that *same*
+    array module -- not yet transferred to host -- so ``rank_gene_pairs``
+    can rank/sort on-device too when ``xp`` is cupy (plans/optimization.md
+    #6d); it does the one host transfer, once, after sorting.
+
+    Genes stay as integer indices (``geneA_idx``/``geneB_idx``) rather than
+    name strings here -- like R's own ``select_genes_cpp``, which maps
+    indices to gene names only at the very end (``select_genes.R``) -- so
+    ranking never has to drag string columns along (plans/optimization.md
+    #6c); callers map back to names once, after ranking, for the handful
+    of rows that matter.
     """
     if zscore_mean_threshold <= 0 or zscore_sn_threshold <= 0:
         raise ValueError("zscore_mean_threshold and zscore_sn_threshold need to be positive")
@@ -63,19 +67,31 @@ def prefilter_gene_pairs(
         vmessage(verbose, "No genes passed the cutoff. Decreasing thresholds by 0.1...")
         keep = (sn_flat >= sn_thr) & (xp.abs(mean_flat) >= mean_thr)
 
-    return pd.DataFrame(
-        {
-            "geneA_idx": to_numpy(i_idx[keep]),
-            "geneB_idx": to_numpy(j_idx[keep]),
-            "mean_zscore": to_numpy(mean_flat[keep]),
-            "sd_zscore": to_numpy(sd_flat[keep]),
-            "sn_zscore": to_numpy(sn_flat[keep]),
-        }
-    )
+    return {
+        "geneA_idx": i_idx[keep],
+        "geneB_idx": j_idx[keep],
+        "mean_zscore": mean_flat[keep],
+        "sd_zscore": sd_flat[keep],
+        "sn_zscore": sn_flat[keep],
+    }
+
+
+def _min_rank(values, xp):
+    """``pandas.Series(values).rank(method="min")``, vectorized in ``xp``.
+
+    A tied value's rank is the rank of its first occurrence in sorted
+    order, which ``searchsorted(sorted(values), values, side="left") + 1``
+    gives directly -- verified bit-exact against pandas' own
+    ``rank(method="min")`` (plans/optimization.md #6d). Assumes no NaNs,
+    which holds here: ``prefilter_gene_pairs`` only ever keeps pairs whose
+    stats already cleared a real-valued threshold.
+    """
+    sorted_values = xp.sort(values)
+    return xp.searchsorted(sorted_values, values, side="left") + 1
 
 
 def rank_gene_pairs(
-    prefiltered: pd.DataFrame,
+    prefiltered: dict,
     score_weights: tuple[float, float] = (0.4, 0.6),
     direction: str = "both",
 ) -> pd.DataFrame:
@@ -84,23 +100,69 @@ def rank_gene_pairs(
     Pairs are ranked by a weighted sum of the rank of the (possibly
     signed, depending on ``direction``) mean z-score and the rank of the sd
     z-score -- lower sd (more consistent across batches) ranks better.
+
+    Always returns a host-side pandas DataFrame, already sorted by rank --
+    but *how* it gets there is backend-conditional. For cupy input, the
+    whole rank+sort runs on-device via :func:`_min_rank` (``cupy.sort`` +
+    ``cupy.searchsorted``), transferring to host only once, at the end:
+    ~13x faster than pandas at realistic scale (124.5s -> 9.3s in the
+    plans/optimization.md #6d benchmark), because it avoids forcing a
+    host round-trip just to call ``pandas.Series.rank``. For numpy input,
+    plain pandas ``.rank()`` is used as before -- benchmarked *faster*
+    than the same ``sort``/``searchsorted`` approach on CPU (pandas' rank
+    is already well-tuned there), so this isn't a single "better"
+    algorithm, it's backend-dependent which one wins.
+
+    Both branches sort with ``kind="stable"`` rather than each backend's
+    default (pandas: quicksort; cupy: introsort-like), which matters
+    because the combined ``rank`` column ties often: it's a weighted sum
+    of two *integer* ranks, so e.g. ``rank_mean=1, rank_sd=5`` and
+    ``rank_mean=4, rank_sd=3`` both give ``3.4`` at the default weights.
+    A non-stable sort breaks those ties however the algorithm happens to
+    -- verified to disagree between pandas and cupy's default sorts on
+    realistic data, which would make ``extract_unique_genes``'s selection
+    depend on which backend ran it. Stable sort instead breaks every tie
+    by the pairs' original (pre-rank) order, which is identical input on
+    both backends and verified to make the two paths agree exactly.
     """
     if direction not in ("both", "anticor", "cor"):
         raise ValueError(f"direction must be 'both', 'anticor' or 'cor', got {direction!r}")
 
-    df = prefiltered.copy()
-    if direction == "both":
-        mean_rank_key = -df["mean_zscore"].abs()
-    elif direction == "anticor":
-        mean_rank_key = df["mean_zscore"]
-    else:  # cor
-        mean_rank_key = -df["mean_zscore"]
+    xp, _ = get_array_module(prefiltered["mean_zscore"])
+    mean_zscore = prefiltered["mean_zscore"]
+    sd_zscore = prefiltered["sd_zscore"]
 
-    rank_mean = mean_rank_key.rank(method="min")
+    if direction == "both":
+        mean_rank_key = -xp.abs(mean_zscore)
+    elif direction == "anticor":
+        mean_rank_key = mean_zscore
+    else:  # cor
+        mean_rank_key = -mean_zscore
+
+    if xp.__name__ == "cupy":
+        rank_mean = _min_rank(mean_rank_key, xp).astype(xp.float64)
+        rank_sd = _min_rank(sd_zscore, xp).astype(xp.float64)
+        combined = rank_mean * score_weights[0] + rank_sd * score_weights[1]
+        final_rank = _min_rank(combined, xp)
+
+        order = xp.argsort(final_rank, kind="stable")
+        return pd.DataFrame(
+            {
+                "geneA_idx": to_numpy(prefiltered["geneA_idx"][order]),
+                "geneB_idx": to_numpy(prefiltered["geneB_idx"][order]),
+                "mean_zscore": to_numpy(mean_zscore[order]),
+                "sd_zscore": to_numpy(sd_zscore[order]),
+                "sn_zscore": to_numpy(prefiltered["sn_zscore"][order]),
+                "rank": to_numpy(final_rank[order]),
+            }
+        )
+
+    df = pd.DataFrame(prefiltered)
+    rank_mean = pd.Series(mean_rank_key).rank(method="min")
     rank_sd = df["sd_zscore"].rank(method="min")
     combined = rank_mean * score_weights[0] + rank_sd * score_weights[1]
     df["rank"] = combined.rank(method="min")
-    return df.sort_values("rank")
+    return df.sort_values("rank", kind="stable")
 
 
 def extract_unique_genes(

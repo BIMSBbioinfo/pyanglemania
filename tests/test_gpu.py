@@ -26,6 +26,7 @@ import cupyx.scipy.sparse as csp  # noqa: E402
 import pyanglemania as pa  # noqa: E402
 from pyanglemania.preprocessing._angles import extract_angles, get_dstat, normalize_matrix  # noqa: E402
 from pyanglemania.preprocessing._batches import genes_passing_min_cells  # noqa: E402
+from pyanglemania.preprocessing._select import prefilter_gene_pairs, rank_gene_pairs  # noqa: E402
 from pyanglemania.preprocessing._stats import StreamingZscoreStats  # noqa: E402
 
 
@@ -80,6 +81,42 @@ def test_streaming_stats_match_numpy_exactly():
     np.testing.assert_allclose(mean_np, mean_cp)
     np.testing.assert_allclose(sd_np[off_diag], sd_cp[off_diag])
     np.testing.assert_allclose(sn_np[off_diag], sn_cp[off_diag])
+
+
+def test_rank_gene_pairs_cupy_native_path_matches_pandas():
+    # Continuous random data makes exact ties between pairs essentially
+    # impossible, so row order (not just rank *values*) should agree
+    # exactly between the cupy-native (sort+searchsorted) and pandas
+    # rank() implementations -- see _select.py::_min_rank and
+    # plans/optimization.md #6d for why these are two different code
+    # paths in the first place (pandas wins on CPU, cupy-native wins on
+    # GPU at scale).
+    n = 60
+    rng = np.random.default_rng(7)
+    mean_np = rng.normal(size=(n, n))
+    sd_np = np.abs(rng.normal(size=(n, n))) + 0.1
+    sn_np = np.abs(rng.normal(size=(n, n))) + 0.1
+    mean_cp, sd_cp, sn_cp = cp.asarray(mean_np), cp.asarray(sd_np), cp.asarray(sn_np)
+
+    for direction in ("both", "anticor", "cor"):
+        pre_np = prefilter_gene_pairs(mean_np, sd_np, sn_np, zscore_mean_threshold=0.1,
+                                       zscore_sn_threshold=0.1, verbose=False)
+        ranked_np = rank_gene_pairs(pre_np, score_weights=(0.4, 0.6), direction=direction)
+
+        pre_cp = prefilter_gene_pairs(mean_cp, sd_cp, sn_cp, zscore_mean_threshold=0.1,
+                                       zscore_sn_threshold=0.1, verbose=False)
+        ranked_cp = rank_gene_pairs(pre_cp, score_weights=(0.4, 0.6), direction=direction)
+
+        np.testing.assert_array_equal(
+            ranked_np["geneA_idx"].to_numpy(), ranked_cp["geneA_idx"].to_numpy()
+        )
+        np.testing.assert_array_equal(
+            ranked_np["geneB_idx"].to_numpy(), ranked_cp["geneB_idx"].to_numpy()
+        )
+        np.testing.assert_allclose(
+            ranked_np["rank"].to_numpy(), ranked_cp["rank"].to_numpy()
+        )
+        assert ranked_cp["rank"].is_monotonic_increasing
 
 
 def test_genes_passing_min_cells_sparse_gpu():

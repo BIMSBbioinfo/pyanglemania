@@ -4,11 +4,12 @@
 
 Items #1, #3, #4 were implemented per the `--> implement` markers (#2 and #5
 were left alone per `--> don't implement`). #6 was discussed in depth
-afterward (see #6 below for the full writeup); its sub-item (c), deferring
-`geneA`/`geneB` string materialization until after ranking, was then also
-implemented by request. Sub-item (d) (bypassing pandas entirely on the GPU
-path) was explicitly deferred. All 63 existing tests (56 CPU + 7 GPU) pass
-and `ruff check` is clean after every change in this file.
+afterward (see #6 below for the full writeup); its sub-items (c) (defer
+`geneA`/`geneB` string materialization until after ranking) and (d) (bypass
+pandas entirely on the GPU path, via verified `cupy.sort`+`searchsorted`)
+were both then implemented by request. All 64 existing tests (56 CPU + 8
+GPU, including a new cupy-vs-pandas ranking parity test added alongside (d))
+pass and `ruff check` is clean after every change in this file.
 
 - **#1** (`_select.py::prefilter_gene_pairs`): now resolves `xp` from
   `get_array_module(mean_zscore)` and does the `triu_indices`/gather/
@@ -292,16 +293,43 @@ CPU-only, potentially 10s-of-millions-of-rows DataFrame regardless of backend.
   selected-gene output**. This is backend-agnostic (helps numpy and cupy
   callers equally, since it doesn't touch the rank/sort *implementation*,
   just what flows through it) and required no new `xp`-branching.
-- (d) **Not implemented** (left for later by choice): going further and
-  bypassing pandas entirely on the GPU path. Verified `cupy.sort` +
-  `cupy.searchsorted` reproduces pandas' `rank(method="min")` bit-exactly,
-  and end-to-end at the real 54.5M-row benchmark scale this took **9.3s
-  vs 124.5s** — but it's *slower than pandas* on the CPU path (31.1s vs
-  17.7s pandas-on-ints at 10M rows; pandas' Cython rank is already
-  well-tuned for CPU), so it would need an `if xp is cupy:` branch,
-  similar in kind to the `syrk` tradeoff in #2 but with a much bigger
-  payoff (13x on the single largest line item in the pipeline, vs ~1.55x
-  on an already-cheap step). Worth revisiting if (c) isn't enough.
+- (d) **Implemented**: bypass pandas entirely on the GPU path.
+  `rank_gene_pairs` now branches on `xp.__name__ == "cupy"`: cupy input
+  ranks via `_min_rank` (`cupy.sort` + `cupy.searchsorted`, verified
+  bit-exact against `pandas.Series.rank(method="min")`) and transfers to
+  host only once, after sorting; numpy input still uses plain pandas
+  `.rank()`, which benchmarked *faster* than the same sort/searchsorted
+  approach on CPU (31.1s vs 17.7s pandas-on-ints at 10M rows -- pandas'
+  Cython rank is already well-tuned there), so this is a real
+  `if xp is cupy:` branch, not a single "better" algorithm for both.
+  `prefilter_gene_pairs` correspondingly stopped calling `to_numpy()`
+  internally -- it now returns a dict of arrays in their native backend,
+  letting `rank_gene_pairs` do the one host transfer at the very end
+  instead.
+
+  **Correctness pitfall caught by a parity test, not by inspection**: the
+  combined `rank` column ties constantly (it's a weighted sum of two
+  *integer* ranks at rational weights -- e.g. `rank_mean=1, rank_sd=5`
+  and `rank_mean=4, rank_sd=3` both give `3.4` at the default `(0.4,
+  0.6)` weights), and pandas' default `sort_values` (quicksort) vs cupy's
+  default `argsort` broke those ties differently -- 7.2% of rows
+  disagreed in a 60-gene test case (`tests/test_gpu.py::
+  test_rank_gene_pairs_cupy_native_path_matches_pandas`, added
+  specifically because this is exactly the kind of thing "it ran without
+  crashing" doesn't catch). Fixed by sorting with `kind="stable"` on
+  *both* branches, which breaks every tie by the pairs' original
+  (pre-rank, `triu_indices`-determined) order -- identical input on both
+  backends, verified to make the two paths agree exactly afterward. This
+  is a deliberate, documented behavior change from the pre-existing
+  (default-quicksort) tie-breaking, justified because it makes selection
+  reproducible across backends, which is a correctness property worth
+  more than matching the old implementation's incidental tie order.
+
+  Benchmarked end-to-end with the real functions at 20k genes (76.1M
+  surviving pairs, a larger and thus harder case than the 54.5M-pair
+  CLAUDE.md benchmark): **14.2s, vs 184s for the combined
+  `prefilter_gene_pairs` + `rank_gene_pairs` cost in that benchmark
+  (prefilter 59.5s + rank 124.5s) — ~13x**.
 
 ## Checked and ruled out (don't re-investigate)
 
