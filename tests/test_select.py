@@ -8,6 +8,8 @@ from pyanglemania.preprocessing._select import (
     extract_unique_genes,
     prefilter_gene_pairs,
     rank_gene_pairs,
+    score_genes_by_aggregate,
+    select_top_genes,
 )
 
 
@@ -154,3 +156,63 @@ def test_extract_unique_genes_fewer_unique_than_requested():
     ranked = pd.DataFrame({"geneA_idx": [0, 0], "geneB_idx": [1, 1]})
     genes = extract_unique_genes(ranked, gene_names, max_n_genes=10)
     assert genes == ["a", "b"]
+
+
+def _toy_prefiltered():
+    # pairs (0,1) mean=2.0 sn=5.0 -> score 10.0; (0,2) mean=-1.0 sn=2.0 ->
+    # score 2.0; (1,3) mean=3.0 sn=1.0 -> score 3.0.
+    return {
+        "geneA_idx": np.array([0, 0, 1]),
+        "geneB_idx": np.array([1, 2, 3]),
+        "mean_zscore": np.array([2.0, -1.0, 3.0]),
+        "sd_zscore": np.array([0.4, 0.5, 1.0]),
+        "sn_zscore": np.array([5.0, 2.0, 1.0]),
+    }
+
+
+def test_score_genes_by_aggregate_both_direction_sums_pair_scores():
+    gene_names = ["g0", "g1", "g2", "g3"]
+    scores = score_genes_by_aggregate(_toy_prefiltered(), gene_names, direction="both")
+    assert list(scores["gene"]) == ["g1", "g0", "g3", "g2"]
+    np.testing.assert_allclose(scores["score"].to_numpy(), [13.0, 12.0, 3.0, 2.0])
+    assert list(scores["degree"]) == [2, 2, 1, 1]
+
+
+def test_score_genes_by_aggregate_anticor_zeroes_positive_pairs():
+    gene_names = ["g0", "g1", "g2", "g3"]
+    scores = score_genes_by_aggregate(_toy_prefiltered(), gene_names, direction="anticor")
+    # Only (0,2)'s negative mean_zscore contributes; (0,1) and (1,3) are
+    # positive and clipped to 0, but their *degree* still counts.
+    by_gene = dict(zip(scores["gene"], scores["score"]))
+    assert by_gene == {"g0": 2.0, "g1": 0.0, "g2": 2.0, "g3": 0.0}
+    assert list(scores["gene"]) == ["g0", "g2", "g1", "g3"]
+
+
+def test_score_genes_by_aggregate_validates_direction():
+    with pytest.raises(ValueError):
+        score_genes_by_aggregate(_toy_prefiltered(), ["g0", "g1", "g2", "g3"], direction="bogus")
+
+
+def test_select_top_genes_excludes_zero_degree():
+    scores = pd.DataFrame(
+        {
+            "gene": ["a", "b", "c", "d"],
+            "score": [10.0, 8.0, 0.0, 0.0],
+            "degree": [2, 0, 0, 1],
+        }
+    )
+    assert select_top_genes(scores, max_n_genes=3) == ["a", "d"]
+
+
+def test_select_top_genes_caps_to_max_n_genes():
+    scores = pd.DataFrame(
+        {"gene": ["a", "b", "c"], "score": [10.0, 8.0, 5.0], "degree": [2, 2, 1]}
+    )
+    assert select_top_genes(scores, max_n_genes=2) == ["a", "b"]
+
+
+def test_select_top_genes_none_returns_all_qualifying():
+    scores = pd.DataFrame(
+        {"gene": ["a", "b", "c"], "score": [10.0, 8.0, 0.0], "degree": [2, 1, 0]}
+    )
+    assert select_top_genes(scores, max_n_genes=None) == ["a", "b"]

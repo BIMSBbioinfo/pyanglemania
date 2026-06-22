@@ -26,7 +26,11 @@ import cupyx.scipy.sparse as csp  # noqa: E402
 import pyanglemania as pa  # noqa: E402
 from pyanglemania.preprocessing._angles import extract_angles, get_dstat, normalize_matrix  # noqa: E402
 from pyanglemania.preprocessing._batches import genes_passing_min_cells  # noqa: E402
-from pyanglemania.preprocessing._select import prefilter_gene_pairs, rank_gene_pairs  # noqa: E402
+from pyanglemania.preprocessing._select import (  # noqa: E402
+    prefilter_gene_pairs,
+    rank_gene_pairs,
+    score_genes_by_aggregate,
+)
 from pyanglemania.preprocessing._stats import StreamingZscoreStats  # noqa: E402
 
 
@@ -117,6 +121,33 @@ def test_rank_gene_pairs_cupy_native_path_matches_pandas():
             ranked_np["rank"].to_numpy(), ranked_cp["rank"].to_numpy()
         )
         assert ranked_cp["rank"].is_monotonic_increasing
+
+
+def test_score_genes_by_aggregate_matches_numpy():
+    n = 40
+    rng = np.random.default_rng(8)
+    mean_np = rng.normal(size=(n, n))
+    sd_np = np.abs(rng.normal(size=(n, n))) + 0.1
+    sn_np = np.abs(rng.normal(size=(n, n))) + 0.1
+    mean_cp, sd_cp, sn_cp = cp.asarray(mean_np), cp.asarray(sd_np), cp.asarray(sn_np)
+    gene_names = [f"g{i}" for i in range(n)]
+
+    for direction in ("both", "anticor", "cor"):
+        pre_np = prefilter_gene_pairs(mean_np, sd_np, sn_np, zscore_mean_threshold=0.1,
+                                       zscore_sn_threshold=0.1, verbose=False)
+        scores_np = score_genes_by_aggregate(pre_np, gene_names, direction=direction)
+
+        pre_cp = prefilter_gene_pairs(mean_cp, sd_cp, sn_cp, zscore_mean_threshold=0.1,
+                                       zscore_sn_threshold=0.1, verbose=False)
+        scores_cp = score_genes_by_aggregate(pre_cp, gene_names, direction=direction)
+
+        assert list(scores_np["gene"]) == list(scores_cp["gene"])
+        np.testing.assert_allclose(
+            scores_np["score"].to_numpy(), scores_cp["score"].to_numpy()
+        )
+        np.testing.assert_array_equal(
+            scores_np["degree"].to_numpy(), scores_cp["degree"].to_numpy()
+        )
 
 
 def test_genes_passing_min_cells_sparse_gpu():

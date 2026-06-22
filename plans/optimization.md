@@ -1,5 +1,22 @@
 # Optimization notes
 
+## Branch: experiment/per-gene-aggregate-selection
+
+Implements alternative 3 from the "other approaches to gene ranking"
+discussion (see the `## 6.` writeup below) as an opt-in
+`anglemania(..., selection_method="per_gene")`, kept off `main` because it
+is a genuinely different, non-R-faithful selection criterion rather than a
+performance optimization of the existing one:
+`score_genes_by_aggregate`/`select_top_genes` in `_select.py` score each
+gene directly (sum of direction-adjusted `|mean_zscore| * sn_zscore` over
+its surviving pairs from the existing on-device `prefilter_gene_pairs`)
+and take the top `max_n_genes` by that score, instead of
+`rank_gene_pairs`/`extract_unique_genes`'s rank-pairs-then-walk approach.
+`xp`-dispatched (works on numpy and cupy), with a GPU-vs-CPU parity test
+in `test_gpu.py`. Not benchmarked against the pairwise path's runtime or
+validated against R/the existing algorithm's gene sets -- it exists to
+explore the idea, not as a recommended default.
+
 ## Implementation status
 
 Items #1, #3, #4 were implemented per the `--> implement` markers (#2 and #5

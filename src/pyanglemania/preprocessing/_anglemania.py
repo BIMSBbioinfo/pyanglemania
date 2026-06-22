@@ -21,7 +21,13 @@ from ._batches import (
     intersect_genes,
     split_obs_indices_by_batch,
 )
-from ._select import extract_unique_genes, prefilter_gene_pairs, rank_gene_pairs
+from ._select import (
+    extract_unique_genes,
+    prefilter_gene_pairs,
+    rank_gene_pairs,
+    score_genes_by_aggregate,
+    select_top_genes,
+)
 from ._stats import StreamingZscoreStats
 
 
@@ -39,6 +45,7 @@ def _check_params(
     normalization_method,
     score_weights,
     direction,
+    selection_method,
 ):
     if batch_key not in adata.obs.columns:
         raise ValueError(f"batch_key {batch_key!r} must be a column in adata.obs")
@@ -74,6 +81,10 @@ def _check_params(
         raise ValueError("score_weights must be a length-2 sequence of values in [0, 1]")
     if direction not in ("both", "anticor", "cor"):
         raise ValueError(f"direction must be 'both', 'anticor' or 'cor', got {direction!r}")
+    if selection_method not in ("pairwise", "per_gene"):
+        raise ValueError(
+            f"selection_method must be 'pairwise' or 'per_gene', got {selection_method!r}"
+        )
 
 
 def anglemania(
@@ -94,6 +105,7 @@ def anglemania(
     normalization_method: str = "divide_by_total_counts",
     score_weights: tuple[float, float] = (0.4, 0.6),
     direction: str = "both",
+    selection_method: str = "pairwise",
     verbose: bool = True,
 ):
     """Select genes with batch-invariant, biologically informative gene-gene angles.
@@ -110,13 +122,28 @@ def anglemania(
 
     Parameters mirror anglemania's R function of the same name; see
     ``ref_packages/anglemania/R/anglemania.R`` for the original.
+    ``selection_method`` is the one exception, new in this port and not
+    R-faithful by design (see ``plans/optimization.md``):
+
+    - ``"pairwise"`` (default): R's own algorithm -- rank gene *pairs* by a
+      weighted combination of mean/sd z-score rank, then walk the ranked
+      pairs to collect unique genes (:func:`._select.rank_gene_pairs`,
+      :func:`._select.extract_unique_genes`). Use this for results
+      comparable to R.
+    - ``"per_gene"``: an experimental alternative that scores each *gene*
+      directly from its surviving pairs and takes the top
+      ``max_n_genes`` by that score (:func:`._select.score_genes_by_aggregate`,
+      :func:`._select.select_top_genes`) -- a genuinely different selection
+      criterion (a gene with many moderate correlations can outscore one
+      with a single very strong correlation), not validated against R.
 
     Modifies ``adata`` in place:
 
     - ``adata.var["anglemania_genes"]``: boolean mask of selected genes.
     - ``adata.uns["anglemania"]``: dict with ``params``, ``intersect_genes``,
-      ``prefiltered_df`` (ranked gene-pair statistics), and
-      ``anglemania_genes``.
+      ``anglemania_genes``, and either ``prefiltered_df`` (ranked gene-pair
+      statistics, when ``selection_method="pairwise"``) or ``gene_scores_df``
+      (per-gene scores, when ``"per_gene"``).
 
     Returns ``adata``.
     """
@@ -134,6 +161,7 @@ def anglemania(
         normalization_method,
         score_weights,
         direction,
+        selection_method,
     )
 
     vmessage(verbose, "Preparing input...")
@@ -201,17 +229,23 @@ def anglemania(
     )
 
     vmessage(verbose, "Extracting filtered features...")
-    ranked = rank_gene_pairs(prefiltered, score_weights=score_weights, direction=direction)
     common_genes_arr = np.asarray(common_genes)
-    selected_genes = extract_unique_genes(ranked, common_genes_arr, max_n_genes)
-
-    # geneA/geneB strings are looked up once here, on the already-ranked
-    # table, instead of before ranking/sorting -- see prefilter_gene_pairs's
-    # docstring (plans/optimization.md #6).
-    prefiltered_df = ranked.assign(
-        geneA=common_genes_arr[ranked["geneA_idx"].to_numpy()],
-        geneB=common_genes_arr[ranked["geneB_idx"].to_numpy()],
-    )[["geneA", "geneB", "mean_zscore", "sd_zscore", "sn_zscore", "rank"]]
+    diagnostics: dict[str, object] = {}
+    if selection_method == "per_gene":
+        scores = score_genes_by_aggregate(prefiltered, common_genes_arr, direction=direction)
+        selected_genes = select_top_genes(scores, max_n_genes)
+        diagnostics["gene_scores_df"] = scores
+    else:
+        ranked = rank_gene_pairs(prefiltered, score_weights=score_weights, direction=direction)
+        selected_genes = extract_unique_genes(ranked, common_genes_arr, max_n_genes)
+        # geneA/geneB strings are looked up once here, on the already-ranked
+        # table, instead of before ranking/sorting -- see
+        # prefilter_gene_pairs's docstring (plans/optimization.md #6).
+        prefiltered_df = ranked.assign(
+            geneA=common_genes_arr[ranked["geneA_idx"].to_numpy()],
+            geneB=common_genes_arr[ranked["geneB_idx"].to_numpy()],
+        )[["geneA", "geneB", "mean_zscore", "sd_zscore", "sn_zscore", "rank"]]
+        diagnostics["prefiltered_df"] = prefiltered_df.reset_index(drop=True)
 
     adata.var["anglemania_genes"] = adata.var_names.isin(selected_genes)
     adata.uns["anglemania"] = {
@@ -230,10 +264,11 @@ def anglemania(
             "normalization_method": normalization_method,
             "score_weights": score_weights,
             "direction": direction,
+            "selection_method": selection_method,
         },
         "intersect_genes": common_genes,
-        "prefiltered_df": prefiltered_df.reset_index(drop=True),
         "anglemania_genes": selected_genes,
+        **diagnostics,
     }
     vmessage(verbose, f"Selected {len(selected_genes)} genes for integration.")
     return adata

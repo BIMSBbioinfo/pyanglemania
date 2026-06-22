@@ -4,6 +4,13 @@ Ported from anglemania's R ``select_genes.R`` (and the C++ pair-extraction
 in ``select_genes_cpp``). The heavy ``(genes x genes)`` matrices are only
 read here; the result is small (at most a few thousand gene pairs) and is
 returned as a plain pandas DataFrame.
+
+``prefilter_gene_pairs`` -> ``rank_gene_pairs`` -> ``extract_unique_genes``
+is R's own pairwise-ranking algorithm (``anglemania(..., selection_method=
+"pairwise")``, the default). ``score_genes_by_aggregate`` ->
+``select_top_genes`` is an experimental, non-R-faithful alternative
+(``selection_method="per_gene"``) that scores genes directly instead of
+ranking pairs -- see their docstrings and plans/optimization.md.
 """
 
 from __future__ import annotations
@@ -204,3 +211,81 @@ def extract_unique_genes(
                 unique_idx = unique_idx[:max_n_genes]
             return list(gene_names[unique_idx])
         prefix = min(n_pairs, prefix * 4)
+
+
+def score_genes_by_aggregate(
+    prefiltered: dict,
+    gene_names: list[str],
+    direction: str = "both",
+) -> pd.DataFrame:
+    """Per-gene score from surviving gene pairs.
+
+    An alternative to ``rank_gene_pairs`` + ``extract_unique_genes``: those
+    rank gene *pairs* and walk the ranked list to find unique genes; this
+    instead reduces each gene's surviving pairs (from
+    ``prefilter_gene_pairs``) directly to one score per gene -- summing,
+    over every surviving pair touching a gene, a direction-adjusted
+    ``|mean_zscore| * sn_zscore``. ``sn_zscore`` is already
+    ``|mean_zscore| / sd_zscore`` (see ``_stats.py::finalize``), so this
+    single product already rewards pairs that are both strong *and*
+    consistent across batches, without needing rank_gene_pairs's separate
+    weighted combination of two ranks.
+
+    This is a genuinely different selection criterion from R's, not a
+    drop-in replacement: a gene with many moderate surviving correlations
+    can outscore a gene with one very strong correlation, which pairwise
+    ranking would tend to surface first. It also only needs an O(n_genes)
+    sort at the end (there are far fewer genes than gene pairs), instead
+    of rank_gene_pairs's O(n_pairs log n_pairs) -- see
+    plans/optimization.md for the context this alternative was explored
+    in and why it isn't the default.
+
+    Returns a DataFrame with one row per gene (``gene``, ``score``,
+    ``degree`` -- the count of surviving pairs touching it), sorted by
+    score descending; pass to :func:`select_top_genes` to pick a final
+    gene list.
+    """
+    if direction not in ("both", "anticor", "cor"):
+        raise ValueError(f"direction must be 'both', 'anticor' or 'cor', got {direction!r}")
+
+    xp, _ = get_array_module(prefiltered["mean_zscore"])
+    mean_zscore = prefiltered["mean_zscore"]
+    sn_zscore = prefiltered["sn_zscore"]
+
+    if direction == "both":
+        signed = xp.abs(mean_zscore)
+    elif direction == "anticor":
+        signed = xp.clip(-mean_zscore, 0, None)
+    else:  # cor
+        signed = xp.clip(mean_zscore, 0, None)
+
+    pair_score = signed * sn_zscore
+    n_genes = len(gene_names)
+    # Each surviving pair contributes its score to *both* genes it connects.
+    idx = xp.concatenate([prefiltered["geneA_idx"], prefiltered["geneB_idx"]])
+    weight = xp.concatenate([pair_score, pair_score])
+
+    gene_score = xp.bincount(idx, weights=weight, minlength=n_genes)
+    gene_degree = xp.bincount(idx, minlength=n_genes)
+
+    df = pd.DataFrame(
+        {
+            "gene": np.asarray(gene_names),
+            "score": to_numpy(gene_score),
+            "degree": to_numpy(gene_degree),
+        }
+    )
+    return df.sort_values("score", ascending=False, kind="stable").reset_index(drop=True)
+
+
+def select_top_genes(scores: pd.DataFrame, max_n_genes: int | None) -> list[str]:
+    """Top ``max_n_genes`` genes by :func:`score_genes_by_aggregate`'s score.
+
+    Excludes genes with no surviving pairs (``degree == 0``) rather than
+    padding the result with arbitrary zero-score genes if fewer than
+    ``max_n_genes`` qualify -- mirroring ``extract_unique_genes``'s same
+    behavior for the pairwise path.
+    """
+    qualifying = scores.loc[scores["degree"] > 0, "gene"]
+    n = len(qualifying) if max_n_genes is None else min(max_n_genes, len(qualifying))
+    return list(qualifying.iloc[:n])

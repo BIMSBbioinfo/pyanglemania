@@ -74,6 +74,28 @@ def test_anglemania_allow_missing_features_runs():
     assert adata.var["anglemania_genes"].sum() == 15
 
 
+def test_anglemania_per_gene_selection_method_runs():
+    adata = example_adata()
+    pa.pp.anglemania(
+        adata,
+        batch_key="batch",
+        dataset_key="dataset",
+        max_n_genes=15,
+        selection_method="per_gene",
+        verbose=False,
+    )
+    assert adata.var["anglemania_genes"].sum() == 15
+
+    res = adata.uns["anglemania"]
+    assert res["params"]["selection_method"] == "per_gene"
+    assert "prefiltered_df" not in res
+
+    scores = res["gene_scores_df"]
+    assert list(scores.columns) == ["gene", "score", "degree"]
+    assert scores["score"].is_monotonic_decreasing
+    assert (scores["degree"] >= 0).all()
+
+
 def test_anglemania_spearman_and_permute_nonzero_run():
     adata = example_adata()
     pa.pp.anglemania(
@@ -103,6 +125,7 @@ def test_anglemania_spearman_and_permute_nonzero_run():
         {"batch_key": "batch", "normalization_method": "bogus"},
         {"batch_key": "batch", "direction": "bogus"},
         {"batch_key": "batch", "score_weights": (0.4, 0.4, 0.2)},
+        {"batch_key": "batch", "selection_method": "bogus"},
     ],
 )
 def test_anglemania_param_validation(kwargs):
