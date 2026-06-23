@@ -34,7 +34,7 @@ def test_normalize_matrix_matches_numpy():
     rng = np.random.default_rng(0)
     X_np = rng.poisson(5, size=(100, 30)).astype(np.float32)
     X_cp = cp.asarray(X_np)
-    for method in ("divide_by_total_counts", "find_residuals"):
+    for method in ("divide_by_total_counts", "find_residuals", "pflog1ppf"):
         out_np = normalize_matrix(X_np, np, method)
         out_cp = cp.asnumpy(normalize_matrix(X_cp, cp, method))
         np.testing.assert_allclose(out_np, out_cp, atol=1e-4)
@@ -49,6 +49,17 @@ def test_extract_angles_cosine_matches_numpy():
     mask = ~np.isnan(corr_np)
     np.testing.assert_allclose(corr_np[mask], corr_cp[mask], atol=1e-4)
     assert np.array_equal(np.isnan(corr_np), np.isnan(corr_cp))
+
+
+def test_extract_angles_phi_s_matches_numpy():
+    rng = np.random.default_rng(11)
+    X_np = rng.normal(size=(80, 12)).astype(np.float32)
+    X_cp = cp.asarray(X_np)
+    phi_s_np = extract_angles(X_np, "phi_s", np)
+    phi_s_cp = cp.asnumpy(extract_angles(X_cp, "phi_s", cp))
+    mask = ~np.isnan(phi_s_np)
+    np.testing.assert_allclose(phi_s_np[mask], phi_s_cp[mask], atol=1e-4)
+    assert np.array_equal(np.isnan(phi_s_np), np.isnan(phi_s_cp))
 
 
 def test_get_dstat_matches_numpy():
@@ -137,6 +148,25 @@ def test_anglemania_runs_on_gpu_backed_adata(sparse):
         adata.X = csp.csr_matrix(adata.X)
 
     pa.pp.anglemania(adata, batch_key="batch", dataset_key="dataset", max_n_genes=15, verbose=False)
+
+    assert adata.var["anglemania_genes"].sum() == 15
+    df = adata.uns["anglemania"]["prefiltered_df"]
+    assert np.isfinite(df[["mean_zscore", "sd_zscore", "sn_zscore"]].to_numpy()).all()
+
+
+def test_anglemania_runs_on_gpu_backed_adata_with_phi_s():
+    adata = pa.datasets.example_adata()
+    adata.X = cp.asarray(adata.X)
+
+    pa.pp.anglemania(
+        adata,
+        batch_key="batch",
+        dataset_key="dataset",
+        max_n_genes=15,
+        method="phi_s",
+        normalization_method="pflog1ppf",
+        verbose=False,
+    )
 
     assert adata.var["anglemania_genes"].sum() == 15
     df = adata.uns["anglemania"]["prefiltered_df"]

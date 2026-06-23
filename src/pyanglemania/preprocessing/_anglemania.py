@@ -46,8 +46,8 @@ def _check_params(
         raise ValueError(f"dataset_key {dataset_key!r} must be a column in adata.obs")
     if max_n_genes is not None and (not isinstance(max_n_genes, int) or max_n_genes < 1):
         raise ValueError("max_n_genes must be a positive integer or None")
-    if method not in ("cosine", "spearman"):
-        raise ValueError(f"method must be 'cosine' or 'spearman', got {method!r}")
+    if method not in ("cosine", "spearman", "phi_s"):
+        raise ValueError(f"method must be 'cosine', 'spearman' or 'phi_s', got {method!r}")
     if min_cells_per_gene < 1:
         raise ValueError("min_cells_per_gene must be >= 1")
     if min_samples_per_gene < 1:
@@ -63,10 +63,10 @@ def _check_params(
         )
     if prefilter_threshold <= 0:
         raise ValueError("prefilter_threshold must be positive")
-    if normalization_method not in ("divide_by_total_counts", "find_residuals"):
+    if normalization_method not in ("divide_by_total_counts", "find_residuals", "pflog1ppf"):
         raise ValueError(
-            "normalization_method must be 'divide_by_total_counts' or "
-            f"'find_residuals', got {normalization_method!r}"
+            "normalization_method must be 'divide_by_total_counts', "
+            f"'find_residuals' or 'pflog1ppf', got {normalization_method!r}"
         )
     if score_weights is not None and (
         len(score_weights) != 2 or not all(0 <= w <= 1 for w in score_weights)
@@ -109,7 +109,12 @@ def anglemania(
     extreme angles across batches.
 
     Parameters mirror anglemania's R function of the same name; see
-    ``ref_packages/anglemania/R/anglemania.R`` for the original.
+    ``ref_packages/anglemania/R/anglemania.R`` for the original. Two
+    ``method``/``normalization_method`` choices are not from R:
+    ``method="phi_s"`` (a proportionality metric in place of correlation)
+    and ``normalization_method="pflog1ppf"`` (a shifted-CLR transform,
+    intended to be used together) -- see ``_angles.py``'s
+    ``extract_angles``/``normalize_matrix`` docstrings.
 
     Modifies ``adata`` in place:
 

@@ -16,10 +16,22 @@ def normalize_matrix(X, xp, method: str = "divide_by_total_counts"):
     log1p'd. ``"find_residuals"``: log1p the counts, then for every gene
     regress out the cell's log1p total count and keep the residual.
 
-    Note: this keeps only the two ``normalization_method`` choices the
-    upstream R ``normalize_matrix`` actually implements -- its own docs
-    advertise a third, ``"scale_by_total_counts"``, but that branch doesn't
-    exist in the R source, so it isn't ported here either.
+    These two are the choices the upstream R ``normalize_matrix`` actually
+    implements -- its own docs advertise a third, ``"scale_by_total_counts"``,
+    but that branch doesn't exist in the R source, so it isn't ported here
+    either.
+
+    ``"pflog1ppf"`` is not from R: it's the shifted-centered-log-ratio
+    transform from Booeshaghi, Hallgrímsdóttir, Gálvez-Merchán & Pachter,
+    "Depth normalization for single-cell genomics count data" (PFlog1pPF,
+    a.k.a. "shifted CLR"), equivalent to
+    ``sc.pp.normalize_total(adata, target_sum=1); sc.pp.log1p(adata);
+    adata.X -= adata.X.mean(axis=1)``: a proportional-fitting step (each
+    cell's counts divided by that cell's total, i.e. ``u = x / sum(x)``), a
+    pseudocount-1 log (``log1p(u)``), then a second proportional-fitting
+    step done as centering in log-space (subtracting each cell's own mean
+    log-proportion) rather than dividing in count-space, since a log has
+    already been applied.
     """
     if method == "divide_by_total_counts":
         total = X.sum(axis=1, keepdims=True)
@@ -31,9 +43,13 @@ def normalize_matrix(X, xp, method: str = "divide_by_total_counts"):
         total_centered = total - total.mean()
         slopes = (total_centered @ x_centered) / xp.sum(total_centered * total_centered)
         return x_centered - xp.outer(total_centered, slopes)
+    if method == "pflog1ppf":
+        total = X.sum(axis=1, keepdims=True)
+        log_u = xp.log1p(X / total)
+        return log_u - log_u.mean(axis=1, keepdims=True)
     raise ValueError(
-        "normalization_method must be 'divide_by_total_counts' or "
-        f"'find_residuals', got {method!r}"
+        "normalization_method must be 'divide_by_total_counts', "
+        f"'find_residuals' or 'pflog1ppf', got {method!r}"
     )
 
 
@@ -87,22 +103,44 @@ def extract_angles(X, method: str, xp):
     per-gene ranks across cells (ties broken by original order rather than
     R's tie-averaging, so this stays vectorized on both numpy and cupy).
 
+    ``"phi_s"`` is not from R: it's the symmetric proportionality metric
+    phi_s from Quinn, Richardson, Lovell & Crowley, "propr: An R-package for
+    Identifying Proportionally Abundant Features Using Compositional Data
+    Analysis" -- ``VLR(i, j) / VLP(i, j)``, the variance of the log-ratio
+    ``X_i - X_j`` over the variance of the log-product ``X_i + X_j``, low
+    for proportional gene pairs and unbounded above otherwise (the inverse
+    sense of a correlation). ``X`` is expected to already be a log-ratio
+    matrix; in this package that's ``normalize_matrix(..., "pflog1ppf")``,
+    deliberately *not* propr's own per-sample CLR (raw counts, log'd after
+    replacing zeros with 1) -- see that function's docstring.
+
     Returns a symmetric ``(genes x genes)`` matrix with NaN on the diagonal.
     """
     if method == "spearman":
         X = xp.argsort(xp.argsort(X, axis=0), axis=0).astype(X.dtype)
-    elif method != "cosine":
-        raise ValueError(f"method must be 'cosine' or 'spearman', got {method!r}")
+    elif method not in ("cosine", "phi_s"):
+        raise ValueError(f"method must be 'cosine', 'spearman' or 'phi_s', got {method!r}")
 
     x_centered = X - X.mean(axis=0, keepdims=True)
     cov = x_centered.T @ x_centered
-    norm = xp.sqrt(xp.sum(x_centered * x_centered, axis=0))
-    corr = cov / xp.outer(norm, norm)
 
-    n = corr.shape[0]
+    if method == "phi_s":
+        # var/cov up to the shared factor 1/(n - 1), which cancels in the
+        # ratio below, so skip it: VLR(i,j) = var(X_i - X_j), and X_i, X_j
+        # already mean-zero makes that sum((x_i - x_j)^2) = cov_ii + cov_jj
+        # - 2*cov_ij directly; VLP is the same with X_i + X_j.
+        var = xp.diagonal(cov)
+        vlr = var[:, None] + var[None, :] - 2 * cov
+        vlp = var[:, None] + var[None, :] + 2 * cov
+        result = vlr / vlp
+    else:
+        norm = xp.sqrt(xp.sum(x_centered * x_centered, axis=0))
+        result = cov / xp.outer(norm, norm)
+
+    n = result.shape[0]
     idx = xp.arange(n)
-    corr[idx, idx] = xp.nan
-    return corr
+    result[idx, idx] = xp.nan
+    return result
 
 
 def get_dstat(perm_corr, xp):

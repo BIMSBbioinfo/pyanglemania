@@ -35,6 +35,34 @@ def test_normalize_find_residuals_matches_per_gene_ols():
     np.testing.assert_allclose(out, expected, atol=1e-8)
 
 
+def test_normalize_pflog1ppf_matches_paper_formula():
+    rng = np.random.default_rng(6)
+    X = rng.poisson(5, size=(30, 7)).astype(float)
+    out = normalize_matrix(X, np, method="pflog1ppf")
+
+    u = X / X.sum(axis=1, keepdims=True)
+    log_u = np.log(u + 1.0)
+    expected = log_u - log_u.mean(axis=1, keepdims=True)
+    np.testing.assert_allclose(out, expected, atol=1e-8)
+    # CLR centering: every cell's transformed row sums to ~0.
+    np.testing.assert_allclose(out.sum(axis=1), 0.0, atol=1e-8)
+
+
+def test_normalize_pflog1ppf_matches_scanpy_pipeline():
+    anndata = pytest.importorskip("anndata")
+    sc = pytest.importorskip("scanpy")
+
+    rng = np.random.default_rng(7)
+    X = rng.poisson(5, size=(30, 7)).astype(float)
+    out = normalize_matrix(X, np, method="pflog1ppf")
+
+    adata = anndata.AnnData(X.copy())
+    sc.pp.normalize_total(adata, target_sum=1)
+    sc.pp.log1p(adata)
+    expected = adata.X - adata.X.mean(axis=1, keepdims=True)
+    np.testing.assert_allclose(out, expected, atol=1e-6)
+
+
 def test_normalize_matrix_rejects_unknown_method():
     with pytest.raises(ValueError):
         normalize_matrix(np.ones((2, 2)), np, method="scale_by_total_counts")
@@ -99,6 +127,43 @@ def test_extract_angles_spearman_uses_ranks():
     np.testing.assert_allclose(actual, expected)
 
 
+def test_extract_angles_phi_s_matches_vlr_vlp_formula():
+    rng = np.random.default_rng(8)
+    X = rng.normal(size=(60, 5))
+    phi_s = extract_angles(X, "phi_s", np)
+
+    n = X.shape[1]
+    expected = np.empty((n, n))
+    for i in range(n):
+        for j in range(n):
+            vlr = np.var(X[:, i] - X[:, j], ddof=1)
+            vlp = np.var(X[:, i] + X[:, j], ddof=1)
+            expected[i, j] = vlr / vlp
+    np.fill_diagonal(expected, np.nan)
+
+    np.testing.assert_allclose(phi_s[~np.eye(n, dtype=bool)], expected[~np.eye(n, dtype=bool)])
+    assert np.all(np.isnan(np.diag(phi_s)))
+    np.testing.assert_allclose(phi_s, phi_s.T, equal_nan=True)
+
+
+def test_extract_angles_phi_s_near_zero_for_proportional_genes():
+    rng = np.random.default_rng(9)
+    base = rng.normal(size=100)
+    # gene B is gene A plus a constant shift in log-ratio space, i.e. a
+    # perfectly proportional pair: their log-ratio is constant (var ~ 0).
+    noise = rng.normal(scale=1e-6, size=100)
+    X = np.column_stack([base, base + 3.0 + noise, rng.normal(size=100)])
+
+    phi_s = extract_angles(X, "phi_s", np)
+    assert phi_s[0, 1] < 1e-6
+    assert phi_s[0, 2] > phi_s[0, 1]
+
+
+def test_extract_angles_rejects_unknown_method():
+    with pytest.raises(ValueError):
+        extract_angles(np.ones((4, 3)), "bogus", np)
+
+
 def test_get_dstat_ignores_diagonal():
     corr = np.array(
         [
@@ -127,3 +192,12 @@ def test_factorise_is_seed_reproducible():
     z1 = factorise(X.copy(), np, seed=7)
     z2 = factorise(X.copy(), np, seed=7)
     np.testing.assert_allclose(z1, z2)
+
+
+def test_factorise_phi_s_with_pflog1ppf_returns_finite_zero_diagonal():
+    rng = np.random.default_rng(10)
+    X = rng.poisson(5, size=(80, 10)).astype(float)
+    z = factorise(X, np, seed=1, method="phi_s", normalization_method="pflog1ppf")
+    assert z.shape == (10, 10)
+    assert np.all(np.isfinite(z))
+    np.testing.assert_allclose(np.diag(z), 0.0)
