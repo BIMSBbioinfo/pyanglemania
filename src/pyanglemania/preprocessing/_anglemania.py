@@ -233,7 +233,7 @@ def anglemania(
             "prefilter_threshold": prefilter_threshold,
             "do_normalize": do_normalize,
             "normalization_method": normalization_method,
-            "score_weights": score_weights,
+            "score_weights": list(score_weights),
             "direction": direction,
         },
         "intersect_genes": common_genes,
