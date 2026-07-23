@@ -80,6 +80,19 @@ cudf, or filtering before transferring off-device) would be the next lever for e
 large gene-panel scale, but hasn't been done. Raising `prefilter_threshold` is the user-facing lever
 to cut the prefilter/rank cost down on very large gene panels in the meantime.
 
+The benchmark above is still bounded by whole-batch materialization (`align_to_common_genes` +
+`factorise` each hold the full `(cells x genes)` matrix, several copies at once, for one batch at a
+time). That becomes its own OOM risk independent of total gene-panel size when a *single batch* is
+very large (tens of thousands of cells) — see `plans/gpu_memory_large_batches.md` (triggered by a
+54-batch dataset with per-batch cell counts up to 22k). Two fixes from that investigation are
+implemented: `StreamingZscoreStats`'s cross-batch accumulators now live in host memory rather than
+GPU memory unconditionally (`_stats.py`), and `pp.anglemania(..., cell_chunk_size=...)` processes an
+oversized batch in row-chunks instead of all at once (`_angles.py::factorise_chunked`), for the
+`method in ("cosine", "phi_s")` / `normalization_method in ("divide_by_total_counts", "pflog1ppf")`
+/ `permute_row_or_column="column"` combination (raises `ValueError` for anything else rather than
+silently ignoring the chunk size). Both default off/unused unless a batch is actually too large to
+fit, so the benchmark above is unaffected.
+
 ## Development commands
 
 ```bash

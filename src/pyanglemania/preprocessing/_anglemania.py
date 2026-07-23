@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 
 from .._utils import get_array_module, vmessage
-from ._angles import factorise
+from ._angles import factorise, factorise_chunked
 from ._batches import (
     add_unique_batch_key,
     align_to_common_genes,
@@ -39,6 +39,7 @@ def _check_params(
     normalization_method,
     score_weights,
     direction,
+    cell_chunk_size,
 ):
     if batch_key not in adata.obs.columns:
         raise ValueError(f"batch_key {batch_key!r} must be a column in adata.obs")
@@ -74,6 +75,10 @@ def _check_params(
         raise ValueError("score_weights must be a length-2 sequence of values in [0, 1]")
     if direction not in ("both", "anticor", "cor"):
         raise ValueError(f"direction must be 'both', 'anticor' or 'cor', got {direction!r}")
+    if cell_chunk_size is not None and (
+        not isinstance(cell_chunk_size, int) or cell_chunk_size < 1
+    ):
+        raise ValueError("cell_chunk_size must be a positive integer or None")
 
 
 def anglemania(
@@ -94,6 +99,7 @@ def anglemania(
     normalization_method: str = "divide_by_total_counts",
     score_weights: tuple[float, float] = (0.4, 0.6),
     direction: str = "both",
+    cell_chunk_size: int | None = None,
     verbose: bool = True,
 ):
     """Select genes with batch-invariant, biologically informative gene-gene angles.
@@ -115,6 +121,19 @@ def anglemania(
     and ``normalization_method="pflog1ppf"`` (a shifted-CLR transform,
     intended to be used together) -- see ``_angles.py``'s
     ``extract_angles``/``normalize_matrix`` docstrings.
+
+    ``cell_chunk_size`` (not from R): if given, each batch's angle
+    computation is done in row-chunks of at most this many cells instead of
+    materializing the whole ``(cells x genes)`` batch at once -- bounds peak
+    memory to roughly ``O(cell_chunk_size x genes + genes^2)`` regardless of
+    that batch's actual cell count, for batches too large to fit otherwise
+    (see ``plans/gpu_memory_large_batches.md`` and
+    ``_angles.py::factorise_chunked``). Only supported for the default
+    ``permute_row_or_column="column"`` together with
+    ``method in ("cosine", "phi_s")`` and ``normalization_method in
+    ("divide_by_total_counts", "pflog1ppf")`` -- other combinations raise
+    ``ValueError`` rather than silently ignoring the chunk size. ``None``
+    (default) keeps the original whole-batch behavior, unchanged.
 
     Modifies ``adata`` in place:
 
@@ -139,6 +158,7 @@ def anglemania(
         normalization_method,
         score_weights,
         direction,
+        cell_chunk_size,
     )
 
     vmessage(verbose, "Preparing input...")
@@ -177,20 +197,35 @@ def anglemania(
         max_n_genes = len(common_genes)
 
     vmessage(verbose, "Computing angles and transforming to z-scores...")
-    stats = StreamingZscoreStats(len(common_genes), xp)
+    stats = StreamingZscoreStats(len(common_genes))
     for label, idx in batch_indices.items():
-        X_dense = align_to_common_genes(batch_X[label], batch_genes[label], common_genes, xp)
-        zscores = factorise(
-            X_dense,
-            xp,
-            method=method,
-            permute_row_or_column=permute_row_or_column,
-            permutation_function=permutation_function,
-            normalization_method=normalization_method,
-            do_normalize=do_normalize,
-        )
+        if cell_chunk_size is not None:
+            zscores = factorise_chunked(
+                batch_X[label],
+                batch_genes[label],
+                common_genes,
+                xp,
+                cell_chunk_size,
+                method=method,
+                permute_row_or_column=permute_row_or_column,
+                permutation_function=permutation_function,
+                normalization_method=normalization_method,
+                do_normalize=do_normalize,
+            )
+        else:
+            X_dense = align_to_common_genes(batch_X[label], batch_genes[label], common_genes, xp)
+            zscores = factorise(
+                X_dense,
+                xp,
+                method=method,
+                permute_row_or_column=permute_row_or_column,
+                permutation_function=permutation_function,
+                normalization_method=normalization_method,
+                do_normalize=do_normalize,
+            )
+            del X_dense
         stats.update(zscores, float(weights[label]))
-        del X_dense, zscores
+        del zscores
 
     vmessage(verbose, "Computing statistics...")
     mean_zscore, sds_zscore, sn_zscore = stats.finalize()
@@ -235,6 +270,7 @@ def anglemania(
             "normalization_method": normalization_method,
             "score_weights": list(score_weights),
             "direction": direction,
+            "cell_chunk_size": cell_chunk_size,
         },
         "intersect_genes": common_genes,
         "prefiltered_df": prefiltered_df.reset_index(drop=True),

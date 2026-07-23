@@ -238,6 +238,14 @@ against the current float64 path's output on a real multi-batch dataset
 `mean_zscore`/`sds_zscore`/`sn_zscore` stay within an acceptable tolerance
 before touching this.
 
+**Update (implemented, different route)**: `plans/gpu_memory_large_batches.md`
+fix 1 moved these two accumulators to host (numpy) memory instead of
+touching their dtype — they stay float64 (so the catastrophic-cancellation
+concern above is moot, nothing changed numerically) but are no longer GPU
+buffers at all, which removes them from the GPU OOM risk this item was
+about without needing the float32-precision validation. See
+`_stats.py::StreamingZscoreStats`.
+
 ## 6. `rank_gene_pairs`'s pandas `.rank()` cost — the other CLAUDE.md-flagged bottleneck -->
 
 At 124.5s GPU / 129.2s CPU (the table above), this is the single largest line

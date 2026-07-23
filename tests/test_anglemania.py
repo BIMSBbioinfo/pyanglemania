@@ -103,9 +103,57 @@ def test_anglemania_spearman_and_permute_nonzero_run():
         {"batch_key": "batch", "normalization_method": "bogus"},
         {"batch_key": "batch", "direction": "bogus"},
         {"batch_key": "batch", "score_weights": (0.4, 0.4, 0.2)},
+        {"batch_key": "batch", "cell_chunk_size": 0},
     ],
 )
 def test_anglemania_param_validation(kwargs):
     adata = example_adata()
     with pytest.raises(ValueError):
         pa.pp.anglemania(adata, verbose=False, **kwargs)
+
+
+def test_anglemania_cell_chunk_size_runs_and_records_param():
+    adata = example_adata()
+    pa.pp.anglemania(
+        adata, batch_key="batch", dataset_key="dataset", max_n_genes=15,
+        cell_chunk_size=97, verbose=False,
+    )
+    assert adata.var["anglemania_genes"].sum() == 15
+    assert adata.uns["anglemania"]["params"]["cell_chunk_size"] == 97
+
+
+def test_anglemania_cell_chunk_size_single_chunk_matches_unchunked():
+    # cell_chunk_size larger than every batch's cell count reduces to one
+    # chunk per batch, processed with the same rng draw as the unchunked
+    # path -- selected genes should match exactly.
+    unchunked = example_adata()
+    chunked = example_adata()
+
+    pa.pp.anglemania(
+        unchunked, batch_key="batch", dataset_key="dataset", max_n_genes=15, verbose=False
+    )
+    pa.pp.anglemania(
+        chunked, batch_key="batch", dataset_key="dataset", max_n_genes=15,
+        cell_chunk_size=10_000, verbose=False,
+    )
+    assert list(unchunked.uns["anglemania"]["anglemania_genes"]) == list(
+        chunked.uns["anglemania"]["anglemania_genes"]
+    )
+
+
+def test_anglemania_cell_chunk_size_rejects_incompatible_method():
+    adata = example_adata()
+    with pytest.raises(ValueError):
+        pa.pp.anglemania(
+            adata, batch_key="batch", method="spearman", cell_chunk_size=50, verbose=False
+        )
+
+
+def test_anglemania_cell_chunk_size_sparse_X():
+    adata = example_adata()
+    adata.X = sp.csr_matrix(adata.X)
+    pa.pp.anglemania(
+        adata, batch_key="batch", dataset_key="dataset", max_n_genes=15,
+        cell_chunk_size=97, verbose=False,
+    )
+    assert adata.var["anglemania_genes"].sum() == 15

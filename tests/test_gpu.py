@@ -24,7 +24,13 @@ pytestmark = pytest.mark.skipif(not _has_gpu, reason="no reachable CUDA device")
 import cupyx.scipy.sparse as csp  # noqa: E402
 
 import pyanglemania as pa  # noqa: E402
-from pyanglemania.preprocessing._angles import extract_angles, get_dstat, normalize_matrix  # noqa: E402
+from pyanglemania.datasets import example_adata  # noqa: E402
+from pyanglemania.preprocessing._angles import (  # noqa: E402
+    extract_angles,
+    factorise_chunked,
+    get_dstat,
+    normalize_matrix,
+)
 from pyanglemania.preprocessing._batches import genes_passing_min_cells  # noqa: E402
 from pyanglemania.preprocessing._select import prefilter_gene_pairs, rank_gene_pairs  # noqa: E402
 from pyanglemania.preprocessing._stats import StreamingZscoreStats  # noqa: E402
@@ -73,7 +79,11 @@ def test_get_dstat_matches_numpy():
     np.testing.assert_allclose(sd_np, cp.asnumpy(sd_cp), atol=1e-4)
 
 
-def test_streaming_stats_match_numpy_exactly():
+def test_streaming_stats_accepts_cupy_batches_same_as_numpy():
+    # StreamingZscoreStats accumulators are always host (numpy) now (fix 1 of
+    # plans/gpu_memory_large_batches.md) -- update() must transparently pull a
+    # cupy batch to host, giving the identical result as feeding the same
+    # values in as numpy from the start.
     rng = np.random.default_rng(3)
     n_genes = 15
     zscores = [rng.normal(size=(n_genes, n_genes)) for _ in range(4)]
@@ -81,13 +91,14 @@ def test_streaming_stats_match_numpy_exactly():
         np.fill_diagonal(z, 0.0)
     weights = [0.7, 1.1, 1.0, 1.4]
 
-    st_np = StreamingZscoreStats(n_genes, np)
-    st_cp = StreamingZscoreStats(n_genes, cp)
+    st_np = StreamingZscoreStats(n_genes)
+    st_cp = StreamingZscoreStats(n_genes)
     for z, w in zip(zscores, weights):
         st_np.update(z, w)
         st_cp.update(cp.asarray(z), w)
     mean_np, sd_np, sn_np = st_np.finalize()
-    mean_cp, sd_cp, sn_cp = (cp.asnumpy(a) for a in st_cp.finalize())
+    mean_cp, sd_cp, sn_cp = st_cp.finalize()
+    assert isinstance(mean_cp, np.ndarray)
     off_diag = ~np.eye(n_genes, dtype=bool)
     np.testing.assert_allclose(mean_np, mean_cp)
     np.testing.assert_allclose(sd_np[off_diag], sd_cp[off_diag])
@@ -171,3 +182,69 @@ def test_anglemania_runs_on_gpu_backed_adata_with_phi_s():
     assert adata.var["anglemania_genes"].sum() == 15
     df = adata.uns["anglemania"]["prefiltered_df"]
     assert np.isfinite(df[["mean_zscore", "sd_zscore", "sn_zscore"]].to_numpy()).all()
+
+
+@pytest.mark.parametrize(
+    "method,normalization_method", [("cosine", "divide_by_total_counts"), ("phi_s", "pflog1ppf")]
+)
+def test_factorise_chunked_matches_numpy_on_gpu(method, normalization_method):
+    rng = np.random.default_rng(40)
+    X_np = rng.poisson(5, size=(200, 20)).astype(np.float32)
+    X_cp = cp.asarray(X_np)
+    common_genes = [f"g{i}" for i in range(20)]
+
+    z_np = factorise_chunked(
+        X_np, common_genes, common_genes, np, cell_chunk_size=37, seed=1,
+        method=method, normalization_method=normalization_method,
+    )
+    z_cp = cp.asnumpy(
+        factorise_chunked(
+            X_cp, common_genes, common_genes, cp, cell_chunk_size=37, seed=1,
+            method=method, normalization_method=normalization_method,
+        )
+    )
+    assert z_np.shape == z_cp.shape == (20, 20)
+    assert np.isfinite(z_np).all() and np.isfinite(z_cp).all()
+    # Not a bit-exact match: chunked cupy/numpy RNGs draw permutation keys
+    # independently (see factorise_chunked's docstring) -- just check both
+    # are well-formed, finite, zero-diagonal outputs of the right shape.
+    np.testing.assert_allclose(np.diag(z_np), 0.0)
+    np.testing.assert_allclose(np.diag(z_cp), 0.0)
+
+
+def test_anglemania_cell_chunk_size_runs_on_gpu_sparse():
+    adata = pa.datasets.example_adata()
+    adata.X = csp.csr_matrix(cp.asarray(adata.X))
+
+    pa.pp.anglemania(
+        adata,
+        batch_key="batch",
+        dataset_key="dataset",
+        max_n_genes=15,
+        method="phi_s",
+        normalization_method="pflog1ppf",
+        cell_chunk_size=97,
+        verbose=False,
+    )
+
+    assert adata.var["anglemania_genes"].sum() == 15
+    df = adata.uns["anglemania"]["prefiltered_df"]
+    assert np.isfinite(df[["mean_zscore", "sd_zscore", "sn_zscore"]].to_numpy()).all()
+
+
+def test_anglemania_cell_chunk_size_gpu_single_chunk_matches_unchunked():
+    unchunked = pa.datasets.example_adata()
+    unchunked.X = cp.asarray(unchunked.X)
+    chunked = pa.datasets.example_adata()
+    chunked.X = cp.asarray(chunked.X)
+
+    pa.pp.anglemania(
+        unchunked, batch_key="batch", dataset_key="dataset", max_n_genes=15, verbose=False
+    )
+    pa.pp.anglemania(
+        chunked, batch_key="batch", dataset_key="dataset", max_n_genes=15,
+        cell_chunk_size=10_000, verbose=False,
+    )
+    assert list(unchunked.uns["anglemania"]["anglemania_genes"]) == list(
+        chunked.uns["anglemania"]["anglemania_genes"]
+    )

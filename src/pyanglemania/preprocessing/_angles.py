@@ -7,6 +7,8 @@ as ``xp`` (``numpy`` or ``cupy``), so it runs unmodified on CPU or GPU.
 
 from __future__ import annotations
 
+from ._batches import align_to_common_genes
+
 
 def normalize_matrix(X, xp, method: str = "divide_by_total_counts"):
     """Normalize a dense ``(cells x genes)`` matrix.
@@ -190,4 +192,168 @@ def factorise(
     zscores = (corr - mean[None, :]) / sd[None, :]
     # Matches R's `zscores[is.na(zscores)] <- 0`: degenerate all-zero-
     # correlation columns (mean == sd == 0) become 0/0 == NaN, here too.
+    return xp.where(xp.isnan(zscores), 0.0, zscores)
+
+
+_CHUNKABLE_METHODS = ("cosine", "phi_s")
+_CHUNKABLE_NORMALIZATIONS = ("divide_by_total_counts", "pflog1ppf")
+
+
+def _angles_from_moments(col_sum, sum_sq, n_cells: int, method: str, xp):
+    """``extract_angles``'s result, given only accumulated moments.
+
+    ``sum_sq`` is the *uncentered* second moment ``sum_i(x_i @ x_i.T)`` and
+    ``col_sum`` the per-column sum, both summable additively over row-chunks
+    of ``X`` -- unlike ``extract_angles``, which needs the whole ``(cells x
+    genes)`` matrix at once to center it first. The centered Gram matrix
+    ``cov`` (``x_centered.T @ x_centered``, no ``1/(n-1)`` factor -- see
+    ``extract_angles``'s docstring for why that factor is never applied
+    there either, since it cancels in both the cosine and phi_s ratios) is
+    recovered from the uncentered moments via the standard identity
+    ``sum_i((x_i - mean) @ (x_i - mean).T) == sum_sq - n * outer(mean, mean)``,
+    the same one already used across batches in ``_stats.py``.
+    """
+    mean = col_sum / n_cells
+    cov = sum_sq - n_cells * xp.outer(mean, mean)
+
+    if method == "phi_s":
+        var = xp.diagonal(cov)
+        vlr = var[:, None] + var[None, :] - 2 * cov
+        vlp = var[:, None] + var[None, :] + 2 * cov
+        result = vlr / vlp
+    else:
+        norm = xp.sqrt(xp.diagonal(cov))
+        result = cov / xp.outer(norm, norm)
+
+    n = result.shape[0]
+    idx = xp.arange(n)
+    result[idx, idx] = xp.nan
+    return result
+
+
+def factorise_chunked(
+    X,
+    batch_genes: list[str],
+    common_genes: list[str],
+    xp,
+    cell_chunk_size: int,
+    method: str = "cosine",
+    seed: int = 1,
+    permute_row_or_column: str = "column",
+    permutation_function: str = "sample",
+    normalization_method: str = "divide_by_total_counts",
+    do_normalize: bool = True,
+):
+    """Memory-bounded equivalent of ``factorise``, for one very large batch.
+
+    ``factorise`` (and the ``align_to_common_genes`` call that precedes it
+    in ``_anglemania.py``) each materialize a full ``(cells x genes)`` dense
+    array -- several of them coexist at once (raw, permuted, normalized real,
+    normalized permuted) -- which is the "bottleneck 2" documented in
+    ``plans/gpu_memory_large_batches.md``: fine for most batches, but a
+    problem for a batch with tens of thousands of cells at a large gene
+    count (e.g. ``allow_missing_features=True`` pushing the gene universe up).
+
+    This computes the exact same z-score matrix as ``factorise`` would (up
+    to floating point summation order, and the caveat about permutation
+    randomness below), but processes ``X`` in row-chunks of at most
+    ``cell_chunk_size`` cells, taking each chunk from raw counts through
+    alignment/permutation/normalization to an accumulated contribution to
+    the ``(genes x genes)`` Gram matrix, then discarding it -- so peak
+    memory is ``O(cell_chunk_size x genes + genes^2)`` regardless of how
+    many cells this batch actually has (see ``_angles_from_moments``'s
+    docstring for the identity this relies on to stay exact, not a
+    subsample). ``X`` is passed in *unaligned*, i.e. still only restricted
+    to ``batch_genes`` (this batch's own passing genes) as in
+    ``_anglemania.py``'s ``batch_X`` -- alignment to ``common_genes`` also
+    has to happen per chunk, or the whole point is lost.
+
+    Only supports the combination of options where every step from
+    permutation through normalization is row-independent (chunkable without
+    a separate pass to compute global statistics first) -- which happens to
+    be this package's defaults, and the combination used by both
+    ``method``/``normalization_method`` configs in the real workload this
+    was written for (NBAtlas malignant-compartment stability sweep, see
+    ``plans/gpu_memory_large_batches.md``):
+
+    - ``permute_row_or_column="column"`` (the default): permutes within each
+      cell, independently per row, so any row-chunking permutes correctly.
+      ``"row"`` permutes within each *gene*, across all cells -- inherently
+      needs every cell of a column at once, so isn't chunkable this way.
+    - ``method`` must be ``"cosine"`` or ``"phi_s"``: both only need the
+      centered Gram matrix (see ``_angles_from_moments``). ``"spearman"``
+      needs a global rank over every cell in the batch, which isn't an
+      additive statistic.
+    - ``normalization_method`` must be ``"divide_by_total_counts"`` or
+      ``"pflog1ppf"``: both normalize each cell using only that cell's own
+      total, so they're row-independent. ``"find_residuals"`` regresses out
+      each gene's dependence on log total counts, which needs the global
+      per-gene mean (and the global total-count centering) *before* any row
+      can be normalized -- a genuine two-pass dependency this function
+      doesn't implement.
+
+    Raises ``ValueError`` for any other combination rather than silently
+    falling back to the full-materialization path, so a caller relying on
+    the memory bound isn't surprised by an OOM anyway.
+
+    Caveat: unlike ``factorise``, results are only reproducible for a fixed
+    ``seed`` *and* ``cell_chunk_size`` together. The real (unpermuted) data's
+    angle matrix matches ``factorise`` almost exactly (floating point only);
+    the permuted null does not, because generating the permutation's random
+    keys is itself chunked -- an RNG draw of shape ``(chunk, genes)`` per
+    chunk is not the same draw sequence as one ``(cells, genes)`` call. The
+    null is still a valid independent random permutation either way, just
+    not a bit-identical one across chunk sizes.
+    """
+    if permute_row_or_column != "column":
+        raise ValueError(
+            "cell_chunk_size only supports permute_row_or_column='column' "
+            f"(row-independent permutation); got {permute_row_or_column!r}, which "
+            "permutes across all cells in a column and needs the whole batch at once."
+        )
+    if method not in _CHUNKABLE_METHODS:
+        raise ValueError(
+            f"cell_chunk_size does not support method={method!r} (needs a global "
+            f"rank over every cell); use one of {_CHUNKABLE_METHODS}, or omit "
+            "cell_chunk_size."
+        )
+    if normalization_method not in _CHUNKABLE_NORMALIZATIONS:
+        raise ValueError(
+            f"cell_chunk_size does not support normalization_method={normalization_method!r} "
+            f"(needs a global pass before centering); use one of "
+            f"{_CHUNKABLE_NORMALIZATIONS}, or omit cell_chunk_size."
+        )
+    if cell_chunk_size < 1:
+        raise ValueError("cell_chunk_size must be a positive integer")
+
+    n_cells = X.shape[0]
+    n_genes = len(common_genes)
+    rng = xp.random.default_rng(seed)
+
+    sum_real = xp.zeros(n_genes, dtype=xp.float64)
+    sum_perm = xp.zeros(n_genes, dtype=xp.float64)
+    ss_real = xp.zeros((n_genes, n_genes), dtype=xp.float64)
+    ss_perm = xp.zeros((n_genes, n_genes), dtype=xp.float64)
+
+    for start in range(0, n_cells, cell_chunk_size):
+        chunk = X[start : start + cell_chunk_size]
+        chunk_real = align_to_common_genes(chunk, batch_genes, common_genes, xp)
+        chunk_perm = permute_matrix(chunk_real, 1, permutation_function, xp, rng)
+
+        if do_normalize:
+            chunk_real = normalize_matrix(chunk_real, xp, normalization_method)
+            chunk_perm = normalize_matrix(chunk_perm, xp, normalization_method)
+
+        sum_real += chunk_real.sum(axis=0, dtype=xp.float64)
+        sum_perm += chunk_perm.sum(axis=0, dtype=xp.float64)
+        ss_real += (chunk_real.T @ chunk_real).astype(xp.float64)
+        ss_perm += (chunk_perm.T @ chunk_perm).astype(xp.float64)
+        del chunk, chunk_real, chunk_perm
+
+    corr = _angles_from_moments(sum_real, ss_real, n_cells, method, xp)
+    perm_corr = _angles_from_moments(sum_perm, ss_perm, n_cells, method, xp)
+    del sum_real, sum_perm, ss_real, ss_perm
+
+    mean, sd = get_dstat(perm_corr, xp)
+    zscores = (corr - mean[None, :]) / sd[None, :]
     return xp.where(xp.isnan(zscores), 0.0, zscores)

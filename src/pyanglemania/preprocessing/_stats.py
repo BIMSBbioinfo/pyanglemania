@@ -19,24 +19,45 @@ which avoids needing the final mean before seeing every batch. ``sum(w)``/
 every per-batch z-score matrix produced by :func:`._angles.factorise` has
 already had its NaNs replaced with 0 -- there is no per-pair "missing in
 this batch" case left to weight differently from the rest of the matrix.
+
+The two accumulators live in **host (numpy) memory, always**, regardless of
+whether ``update()`` is fed numpy or cupy z-score matrices -- see
+``plans/gpu_memory_large_batches.md`` fix 1. They are touched exactly once
+per batch (inside ``update()``), so pulling a cupy batch to host there is a
+single ``cupy.asnumpy()`` D2H transfer per batch, not repeated GPU<->host
+ping-pong. This removes the two biggest *persistent* GPU buffers in the
+whole pipeline (they were ``float64``, i.e. the most expensive dtype, held
+for the entire run) at the cost of one ``(genes x genes)`` transfer per
+batch, which is cheap relative to that batch's angle computation. It also
+means ``finalize()`` always returns plain numpy arrays now; downstream
+(``_select.py``) already handles numpy input identically to cupy input.
 """
 
 from __future__ import annotations
 
+import numpy as np
+
+from .._utils import to_numpy
+
 
 class StreamingZscoreStats:
-    """Accumulates weighted mean/sd/SNR of z-score matrices across batches."""
+    """Accumulates weighted mean/sd/SNR of z-score matrices across batches.
 
-    def __init__(self, n_genes: int, xp):
-        self.xp = xp
+    Accumulators are always host (numpy) arrays -- see module docstring --
+    so this class no longer needs to know which array module a caller's
+    batches come from; ``update()`` figures that out per call.
+    """
+
+    def __init__(self, n_genes: int):
         shape = (n_genes, n_genes)
         self._w_sum = 0.0
         self._w_sq_sum = 0.0
-        self._wz_sum = xp.zeros(shape, dtype=xp.float64)
-        self._wz2_sum = xp.zeros(shape, dtype=xp.float64)
+        self._wz_sum = np.zeros(shape, dtype=np.float64)
+        self._wz2_sum = np.zeros(shape, dtype=np.float64)
 
     def update(self, zscores, weight: float) -> None:
         """Fold one batch's z-score matrix in; it can be discarded after this."""
+        zscores = to_numpy(zscores)
         self._w_sum += weight
         self._w_sq_sum += weight * weight
         self._wz_sum += weight * zscores
@@ -49,7 +70,7 @@ class StreamingZscoreStats:
         :meth:`update` -- it consumes the accumulators (see below) rather
         than just reading them.
         """
-        xp = self.xp
+        xp = np
         w_sum = self._w_sum
         denom = w_sum - self._w_sq_sum / w_sum
 

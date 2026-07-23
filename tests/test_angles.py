@@ -4,10 +4,12 @@ import numpy as np
 import pytest
 
 from pyanglemania.preprocessing._angles import (
+    _angles_from_moments,
     _shuffle_full,
     _shuffle_nonzero,
     extract_angles,
     factorise,
+    factorise_chunked,
     get_dstat,
     normalize_matrix,
     permute_matrix,
@@ -201,3 +203,127 @@ def test_factorise_phi_s_with_pflog1ppf_returns_finite_zero_diagonal():
     assert z.shape == (10, 10)
     assert np.all(np.isfinite(z))
     np.testing.assert_allclose(np.diag(z), 0.0)
+
+
+@pytest.mark.parametrize("method", ["cosine", "phi_s"])
+def test_angles_from_moments_matches_extract_angles(method):
+    rng = np.random.default_rng(20)
+    X = rng.normal(size=(50, 6)).astype(np.float64)
+    expected = extract_angles(X, method, np)
+
+    col_sum = X.sum(axis=0, dtype=np.float64)
+    sum_sq = X.T @ X
+    actual = _angles_from_moments(col_sum, sum_sq, X.shape[0], method, np)
+
+    n = actual.shape[0]
+    off_diag = ~np.eye(n, dtype=bool)
+    np.testing.assert_allclose(actual[off_diag], expected[off_diag], atol=1e-8)
+    assert np.all(np.isnan(np.diag(actual)))
+
+
+@pytest.mark.parametrize("n_chunks", [1, 2, 3, 7])
+def test_angles_from_moments_accumulation_is_chunk_size_independent(n_chunks):
+    # The whole point of factorise_chunked is that summing the moments over
+    # row-chunks gives an exact (not approximate) result -- verify that
+    # directly, independent of any permutation randomness.
+    rng = np.random.default_rng(21)
+    X = rng.normal(size=(97, 9)).astype(np.float64)
+    expected = extract_angles(X, "cosine", np)
+
+    col_sum = np.zeros(9, dtype=np.float64)
+    sum_sq = np.zeros((9, 9), dtype=np.float64)
+    for chunk in np.array_split(X, n_chunks, axis=0):
+        col_sum += chunk.sum(axis=0, dtype=np.float64)
+        sum_sq += chunk.T @ chunk
+    actual = _angles_from_moments(col_sum, sum_sq, X.shape[0], "cosine", np)
+
+    n = actual.shape[0]
+    off_diag = ~np.eye(n, dtype=bool)
+    np.testing.assert_allclose(actual[off_diag], expected[off_diag], atol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "method,normalization_method",
+    [("cosine", "divide_by_total_counts"), ("phi_s", "pflog1ppf")],
+)
+def test_factorise_chunked_single_chunk_matches_factorise(method, normalization_method):
+    # With cell_chunk_size >= n_cells there's exactly one chunk, processed
+    # with the same rng draw as the non-chunked path -- results should match
+    # up to floating point summation order (factorise_chunked recovers the
+    # centered Gram matrix from uncentered moments, factorise centers
+    # directly).
+    rng = np.random.default_rng(30)
+    X = rng.poisson(5, size=(80, 10)).astype(np.float32)
+    common_genes = [f"g{i}" for i in range(10)]
+
+    expected = factorise(
+        X.copy(), np, seed=5, method=method, normalization_method=normalization_method
+    )
+    actual = factorise_chunked(
+        X.copy(),
+        common_genes,
+        common_genes,
+        np,
+        cell_chunk_size=1000,
+        seed=5,
+        method=method,
+        normalization_method=normalization_method,
+    )
+    np.testing.assert_allclose(actual, expected, atol=1e-3)
+
+
+def test_factorise_chunked_multiple_chunks_runs_and_is_well_formed():
+    rng = np.random.default_rng(31)
+    X = rng.poisson(5, size=(80, 10)).astype(np.float32)
+    common_genes = [f"g{i}" for i in range(10)]
+
+    z = factorise_chunked(X, common_genes, common_genes, np, cell_chunk_size=13, seed=1)
+    assert z.shape == (10, 10)
+    assert np.all(np.isfinite(z))
+    np.testing.assert_allclose(np.diag(z), 0.0)
+
+
+def test_factorise_chunked_matches_sparse_input():
+    from scipy import sparse as sp
+
+    rng = np.random.default_rng(32)
+    X_dense = rng.poisson(2, size=(60, 8)).astype(np.float32)
+    X_sparse = sp.csc_matrix(X_dense)
+    common_genes = [f"g{i}" for i in range(8)]
+
+    z_dense = factorise_chunked(X_dense, common_genes, common_genes, np, cell_chunk_size=11, seed=2)
+    z_sparse = factorise_chunked(
+        X_sparse, common_genes, common_genes, np, cell_chunk_size=11, seed=2
+    )
+    np.testing.assert_allclose(z_sparse, z_dense)
+
+
+def test_factorise_chunked_handles_missing_genes_like_align_to_common_genes():
+    rng = np.random.default_rng(33)
+    X = rng.poisson(5, size=(50, 4)).astype(np.float32)
+    batch_genes = ["g0", "g1", "g2"]  # g3 missing from this batch
+    common_genes = ["g0", "g1", "g2", "g3"]
+
+    z = factorise_chunked(
+        X[:, :3], batch_genes, common_genes, np, cell_chunk_size=17, seed=3
+    )
+    assert z.shape == (4, 4)
+    assert np.all(np.isfinite(z))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"permute_row_or_column": "row"},
+        {"method": "spearman"},
+        {"normalization_method": "find_residuals"},
+        {"cell_chunk_size": 0},
+    ],
+)
+def test_factorise_chunked_rejects_unsupported_combinations(kwargs):
+    rng = np.random.default_rng(34)
+    X = rng.poisson(5, size=(20, 5)).astype(np.float32)
+    common_genes = [f"g{i}" for i in range(5)]
+    chunk_size = kwargs.pop("cell_chunk_size", 6)
+    with pytest.raises(ValueError):
+        factorise_chunked(X, common_genes, common_genes, np, chunk_size, **kwargs)

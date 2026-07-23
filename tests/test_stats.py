@@ -28,7 +28,7 @@ def test_streaming_matches_naive_batch_stacking():
         np.fill_diagonal(z, 0.0)
     weights = [0.8, 1.2, 1.0, 0.5, 1.5]
 
-    stats = StreamingZscoreStats(n_genes, np)
+    stats = StreamingZscoreStats(n_genes)
     for z, w in zip(zscores, weights):
         stats.update(z, w)
     mean, sd, sn = stats.finalize()
@@ -48,7 +48,7 @@ def test_streaming_does_not_depend_on_batch_order():
     weights = [1.0, 0.6, 1.3, 0.9]
 
     def run(order):
-        stats = StreamingZscoreStats(n_genes, np)
+        stats = StreamingZscoreStats(n_genes)
         for i in order:
             stats.update(zscores[i], weights[i])
         return stats.finalize()
@@ -66,7 +66,7 @@ def test_streaming_never_materializes_more_than_one_batch_at_a_time():
     # callers are free to discard a batch's z-score matrix right after
     # update() returns, which is the whole point of streaming.
     n_genes = 5
-    stats = StreamingZscoreStats(n_genes, np)
+    stats = StreamingZscoreStats(n_genes)
     accumulator_attrs = [v for v in vars(stats).values() if isinstance(v, np.ndarray)]
     assert all(a.shape == (n_genes, n_genes) for a in accumulator_attrs)
     assert len(accumulator_attrs) == 2  # wz_sum and wz2_sum only
