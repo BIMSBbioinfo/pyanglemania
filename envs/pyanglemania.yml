@@ -6,6 +6,8 @@ dependencies:
   - python=3.12
   - pip
   - scanpy
+  - scikit-misc
+  - click
   - python-igraph
   - leidenalg
   - scvi-tools

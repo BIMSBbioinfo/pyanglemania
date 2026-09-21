@@ -221,3 +221,7 @@ __marimo__/
 # ref_packages
 # plans
 # envs
+tmp/
+papers/
+plans/
+scripts/

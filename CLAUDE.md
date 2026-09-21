@@ -130,13 +130,50 @@ Read `anglemania.R`, `compute_angles.R`, `stats.R`, `select_genes.R`, `prepare_a
 2. **Gene filtering** (`prepare_anglemania.R` → `_batches.py`): drop genes below `min_cells_per_gene` per batch (`genes_passing_min_cells`), reduce to the gene intersection across batches, or to genes present in at least `min_samples_per_gene` batches if `allow_missing_features=True` (`intersect_genes`), then densify/reorder/zero-pad each batch to that common gene set (`align_to_common_genes`).
 3. **Per-batch angle computation** (`compute_angles.R::factorise` → `_angles.py::factorise`), for each batch's `(cells x genes)` matrix:
    - Permute to build a null distribution (`permute_matrix`: `"sample"` shuffles every value, `"permute_nonzero"` shuffles only nonzero entries, leaving zeros in place; `permute_row_or_column` keeps R's parameter values but they map to the *opposite* numpy axis here since this package stores cells x genes where R stores genes x cells — see the docstring in `factorise`).
-   - Normalize both the real and permuted matrices (`normalize_matrix`: default `"divide_by_total_counts"` = CP10K + log1p; alternate `"find_residuals"` regresses out log total counts per gene. Note R's docs also mention a third choice, `"scale_by_total_counts"`, but R's own `normalize_matrix` never implements it — only these two real choices are ported).
-   - Gene-gene relationship matrix for both (`extract_angles`: Pearson correlation across cells, i.e. the "angle" between mean-centered gene vectors; `"spearman"` ranks first — ties broken by original order rather than R's tie-averaging, to keep this vectorized on both numpy and cupy). Diagonal is NaN.
+   - Normalize both the real and permuted matrices (`normalize_matrix`: default `"divide_by_total_counts"` = CP10K + log1p; alternate `"find_residuals"` regresses out log total counts per gene. Note R's docs also mention a third choice, `"scale_by_total_counts"`, but R's own `normalize_matrix` never implements it — only these two are ported from R as-is. A third, non-R choice, `"pflog1ppf"`, was added later — see "Extensions beyond the R port" below).
+   - Gene-gene relationship matrix for both (`extract_angles`: Pearson correlation across cells, i.e. the "angle" between mean-centered gene vectors; `"spearman"` ranks first — ties broken by original order rather than R's tie-averaging, to keep this vectorized on both numpy and cupy). Diagonal is NaN. A third, non-R `method`, `"phi_s"`, was added later — see below.
    - Per-gene (per-column) `mean`/`sd` of the **permuted** matrix (`get_dstat`), then z-score the **real** matrix against that null. This makes the z-score matrix asymmetric (entry `(i, j)` is standardized against gene `j`'s own null, not gene `i`'s) — intentional, matches R, and only the upper triangle is read downstream anyway.
 4. **Cross-batch reduction** (`stats.R::get_list_stats` → `_stats.py::StreamingZscoreStats`): weighted `mean_zscore`, weighted `sds_zscore`, and `sn_zscore = |mean| / sd` per gene pair, accumulated batch-by-batch instead of from a list of all batches' matrices (the core streaming deviation; see the module docstring for the single-pass identity this relies on).
 5. **Prefilter + select** (`select_genes.R` → `_select.py`): keep gene pairs whose `|mean_zscore|` and `sn_zscore` both clear a threshold, auto-relaxed by -0.1 if nothing passes (`prefilter_gene_pairs`); rank by a weighted combination of rank(|mean z-score|) and rank(sd z-score) (`score_weights`, default `(0.4, 0.6)` favors sd; `rank_gene_pairs`); take unique genes from the top-ranked pairs up to `max_n_genes` (`extract_unique_genes`). Results land in `adata.var["anglemania_genes"]` / `adata.uns["anglemania"]`.
 
 All public parameters from R's `anglemania()`/`check_params` are preserved with the same names/values: `batch_key`, `dataset_key`, `max_n_genes`, `min_cells_per_gene`, `min_samples_per_gene`, `allow_missing_features`, `method`, `permute_row_or_column`, `permutation_function`, `prefilter_threshold`, `do_normalize`, `normalization_method`, `score_weights`, `direction`. (`layer` is new, since AnnData has no exact equivalent of R's fixed `counts()` accessor.)
+
+## Extensions beyond the R port
+
+Two `normalize_matrix`/`extract_angles` choices have no R counterpart, added to evaluate
+proportionality (CoDA) as an alternative to correlation for the angle/z-score pipeline. Source
+papers are kept in `papers/` (not the algorithm's R spec — these are reference material for these
+two additions only):
+
+- `normalize_matrix(..., "pflog1ppf")`: the shifted-centered-log-ratio transform ("PFlog1pPF (CLR)")
+  from `papers/2022.05.06.490859v3.full.pdf` (Booeshaghi, Hallgrímsdóttir, Gálvez-Merchán & Pachter,
+  "Depth normalization for single-cell genomics count data"). Per cell: divide by the cell's total
+  count (`u = x / sum(x)`, a proportional-fitting/PF step), `log1p`, then subtract the cell's own
+  mean log-proportion (a second PF step, done as centering since it follows a log) — equivalent to
+  `sc.pp.normalize_total(adata, target_sum=1); sc.pp.log1p(adata); adata.X -= adata.X.mean(axis=1)`
+  (confirmed against `papers/PFlogPF_convo_zulip.md`, a Zulip thread where the paper's authors'
+  collaborators worked out this exact scanpy-equivalent formula). Implemented with plain `xp` ops
+  rather than literal scanpy calls, to keep numpy/cupy dispatch (`normalize_matrix` never imports
+  scanpy/AnnData; it's a pure array function called from inside `factorise`).
+- `extract_angles(..., "phi_s")`: the symmetric proportionality metric φs from
+  `papers/s41598-017-16520-0-2.pdf` (Quinn, Richardson, Lovell & Crowley, "propr: An R-package for
+  Identifying Proportionally Abundant Features Using Compositional Data Analysis") —
+  `VLR(i,j) / VLP(i,j)`, the variance of the log-ratio `A_i - A_j` over the variance of the
+  log-product `A_i + A_j`, for whatever log-ratio matrix `A` is passed in. Low φs means proportional
+  (the *opposite* sense from a correlation, where high means related) and it's unbounded above
+  rather than capped at 1.
+  **Deliberately does not use propr's own CLR** to build `A` (propr replaces zeros in raw counts
+  with 1, then centers per-sample log-counts — depth-dependent in exactly the way the PFlogPF paper
+  argues against). Use `normalization_method="pflog1ppf"` to build `A` instead: pass
+  `method="phi_s", normalization_method="pflog1ppf"` together to `factorise`/`anglemania()` so the
+  matrix φs operates on is the shifted-CLR transform, not raw counts.
+
+Both compose with the rest of the pipeline (permutation, per-batch z-scoring, cross-batch streaming
+reduction, prefilter/rank/select) unmodified, since they preserve the existing function contracts:
+`normalize_matrix` still returns a `(cells x genes)` array, `extract_angles` still returns a
+symmetric `(genes x genes)` array with NaN diagonal. No changes were needed to `_stats.py`/
+`_select.py`. Tested for CPU/GPU parity the same way as the R-ported choices (`tests/test_angles.py`,
+`tests/test_gpu.py`).
 
 ## Architecture
 
