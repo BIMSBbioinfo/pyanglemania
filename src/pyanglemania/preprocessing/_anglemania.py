@@ -141,6 +141,16 @@ def anglemania(
     - ``adata.uns["anglemania"]``: dict with ``params``, ``intersect_genes``,
       ``prefiltered_df`` (ranked gene-pair statistics), and
       ``anglemania_genes``.
+    - **GPU only, sparse input only**: once every batch's cells have been
+      partitioned out of ``adata.X``/``adata.layers[layer]`` (the input is
+      no longer read after that point), that layer is replaced with an
+      empty same-shape placeholder to free its GPU memory -- redundant
+      otherwise, since the per-batch partitions already hold every cell.
+      Doesn't happen for CPU (numpy) input, where host RAM is rarely the
+      binding constraint, or for dense GPU input (a same-shape placeholder
+      wouldn't save anything). If you need the raw layer to survive the
+      call (e.g. for downstream steps in the same script), pass a copy or
+      re-read it afterward.
 
     Returns ``adata``.
     """
@@ -185,6 +195,38 @@ def anglemania(
         batch_genes[label] = list(var_names[mask])
         batch_X[label] = X_b[:, mask]
 
+    # Every batch's data needed downstream now lives in batch_X (already
+    # reduced to that batch's own passing genes) -- X_full itself is never
+    # read again after this point. On GPU this matters: a caller following
+    # this package's own convention (move the *whole* layer to GPU before
+    # calling anglemania() so xp resolves to cupy) leaves X_full's full
+    # (cells x genes) sparse matrix resident on GPU for the rest of the
+    # call otherwise, on top of batch_X's per-batch copies -- redundant,
+    # since batch_X already holds every cell, just batch-partitioned. This
+    # was the actual cause of a "bottleneck 1"-shaped OOM
+    # (plans/gpu_memory_large_batches.md) that showed up even after fixes 1
+    # and 2 there: not the per-batch angle-matrix buffers (already bounded),
+    # but this structural double-residency, at 18,417 genes with a batch
+    # skew large enough to need cell_chunk_size in the first place. Freeing
+    # it here (GPU only -- host RAM is rarely the constraint CPU callers
+    # hit) drops the caller's own reference too, since ``adata.X``/
+    # ``adata.layers[layer]`` was the only other place holding it alive.
+    if xp.__name__ == "cupy" and sp_mod.issparse(X_full):
+        # AnnData's X/layers setters validate the replacement's shape
+        # against adata.shape (rejecting None outright), so free by
+        # replacing with an empty same-shape sparse placeholder rather than
+        # nulling the slot -- an empty CSR matrix costs next to nothing,
+        # unlike a same-shape dense zeros array (which is why this only
+        # applies to sparse input; a GPU-resident dense adata.X can't be
+        # shrunk this way and is left alone).
+        full_shape, full_dtype = X_full.shape, X_full.dtype
+        del X_full
+        placeholder = sp_mod.csr_matrix(full_shape, dtype=full_dtype)
+        if layer is None:
+            adata.X = placeholder
+        else:
+            adata.layers[layer] = placeholder
+
     common_genes = intersect_genes(
         list(batch_genes.values()), allow_missing_features, min_samples_per_gene, verbose
     )
@@ -227,8 +269,27 @@ def anglemania(
         stats.update(zscores, float(weights[label]))
         del zscores
 
+    # batch_X (every batch's own reduced partition) is never read again past
+    # this point either -- same redundancy as X_full above, just discovered
+    # later: on GPU it was staying resident through the entire prefilter/
+    # rank/select stage below, on top of forcing that stage itself onto CPU
+    # (mean_zscore/sds_zscore/sn_zscore come back from the host-resident
+    # StreamingZscoreStats as plain numpy now, so prefilter_gene_pairs/
+    # rank_gene_pairs -- which infer their backend from *that* input --
+    # always ran on CPU regardless of --gpu, silently losing the ~13x
+    # on-device speedup plans/optimization.md #6d measured for this stage).
+    # Freeing batch_X and moving the z-score matrices back to GPU here
+    # restores that speedup; by this point X_full and batch_X together were
+    # the dominant GPU consumers, so there's ample room for three more
+    # (genes x genes) arrays.
+    del batch_X
+
     vmessage(verbose, "Computing statistics...")
     mean_zscore, sds_zscore, sn_zscore = stats.finalize()
+    if xp.__name__ == "cupy":
+        mean_zscore = xp.asarray(mean_zscore)
+        sds_zscore = xp.asarray(sds_zscore)
+        sn_zscore = xp.asarray(sn_zscore)
 
     vmessage(verbose, "Pre-filtering features...")
     prefiltered = prefilter_gene_pairs(

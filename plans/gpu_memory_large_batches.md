@@ -1,11 +1,47 @@
 # GPU memory scaling for large single-batch cell counts + `allow_missing_features`
 
-Status: **fixes 1 and 2 implemented** (see "Implementation status" at the
-bottom). Fixes 3-5 remain investigation-only, for if 1+2 aren't enough.
+Status: **fixes 1 and 2 implemented, plus two more found while validating
+them on the real malignant-compartment amf50 workload** (see "Implementation
+status" at the bottom). Fixes 3-5 below remain investigation-only.
 Triggered by: NBAtlas malignantCells stability sweep (`anglemania_analysis/tasks/nmf`)
 hitting GPU OOM when trying to run `allow_missing_features=True` on the malignant
 compartment, after it had already worked fine on the immune/stroma compartment
 (see that repo's `TODO.md`, "Does `allow_missing_features` fix marker recovery?").
+
+**Update after end-to-end validation on the real workload (18,417-gene amf50
+pool, 244,380 cells, 54 batches, `cell_chunk_size=5000`):** fixes 1+2 alone
+were *not* sufficient — two more distinct OOM sources surfaced, both now
+fixed:
+
+- **`_angles_from_moments`/`factorise_chunked`'s own buffer count.** The
+  initial chunked implementation didn't carry over `_stats.py::finalize()`'s
+  in-place-ops treatment: it kept ~7-8 `(genes x genes)` float64 buffers
+  alive at once (~21.7GB at 18,417 genes, OOMing a 24GB P40 on its own,
+  independent of any per-batch cell count). Fixed by mutating buffers in
+  place through the whole `cov`/`vlr`/`vlp`/`result` chain, mirroring
+  `finalize()`'s style — down to ~3 buffers peak.
+- **`X_full` (the whole batch's original sparse matrix) stays GPU-resident
+  for the entire call, on top of `batch_X`'s per-batch partitions.**
+  Structural, not related to buffer counts at all: a caller following this
+  package's own convention (move the whole layer to GPU before calling
+  `anglemania()`) leaves the *original* full `(cells x genes)` sparse
+  matrix alive the whole time, even though every cell it holds is already
+  duplicated into `batch_X`'s per-batch reduced copies right after the
+  batch-filtering loop — redundant from that point on. This was the actual
+  cause of a repro that survived the first fix (traceback pointed at the
+  very first, smallest batch's `_angles_from_moments` call, immediately
+  after `Computing angles...` — nowhere near the big batches fix 2 targets,
+  which was the tell). Fixed in `_anglemania.py`: once `batch_X` is built,
+  free `X_full` (GPU + sparse input only) by replacing
+  `adata.X`/`adata.layers[layer]` with an empty same-shape placeholder
+  (can't assign `None` — AnnData's setter validates shape) so the last
+  reference to the original drops and cupy's pool can actually reclaim it.
+  Documented as a new (GPU-sparse-only) `adata` side effect in
+  `anglemania()`'s docstring.
+
+Net result on the real workload: full 244,380-cell/54-batch amf50 split
+went from **OOM -> 51.6 min CPU fallback** (fix 1+2 only) to **7.76 min on
+GPU, no OOM** (all four fixes together).
 
 Related existing docs — this note is additive, not a duplicate:
 - `plans/optimization.md` #5 already flags `StreamingZscoreStats`'s float64

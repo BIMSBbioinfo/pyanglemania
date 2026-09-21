@@ -212,18 +212,36 @@ def _angles_from_moments(col_sum, sum_sq, n_cells: int, method: str, xp):
     recovered from the uncentered moments via the standard identity
     ``sum_i((x_i - mean) @ (x_i - mean).T) == sum_sq - n * outer(mean, mean)``,
     the same one already used across batches in ``_stats.py``.
+
+    Mutates ``sum_sq`` in place and returns a result that reuses its buffer
+    rather than allocating a fresh ``(genes x genes)`` array for ``cov`` --
+    safe because ``factorise_chunked`` (the only caller) uses ``sum_sq``
+    exactly once, right here, before discarding it. Verified on a real GPU
+    (Tesla P40): the naive version above kept 7-8 ``(genes x genes)`` float64
+    buffers alive at once at 18,417 genes (~21.7GB, OOMing a 24GB card even
+    with ``cell_chunk_size`` bounding the cell dimension -- this is
+    "bottleneck 1"/fix 3 from ``plans/gpu_memory_large_batches.md``, which
+    the initial ``factorise_chunked`` implementation didn't carry over from
+    ``_stats.py::finalize()``'s equivalent treatment); this version peaks at
+    3 buffers, mirroring that function's in-place style.
     """
     mean = col_sum / n_cells
-    cov = sum_sq - n_cells * xp.outer(mean, mean)
+    cov = sum_sq
+    cov -= n_cells * xp.outer(mean, mean)
 
     if method == "phi_s":
-        var = xp.diagonal(cov)
-        vlr = var[:, None] + var[None, :] - 2 * cov
-        vlp = var[:, None] + var[None, :] + 2 * cov
-        result = vlr / vlp
+        var = xp.diagonal(cov).copy()
+        base = var[:, None] + var[None, :]  # buffer A
+        cov *= 2  # buffer B (=cov), in place
+        vlr = base - cov  # buffer C
+        base += cov  # buffer A becomes vlp, in place
+        result = vlr
+        result /= base  # result = vlr / vlp, reusing buffer C
     else:
-        norm = xp.sqrt(xp.diagonal(cov))
-        result = cov / xp.outer(norm, norm)
+        norm = xp.sqrt(xp.diagonal(cov)).copy()
+        outer_norm = xp.outer(norm, norm)  # buffer A
+        result = cov  # reuse buffer B as the result
+        result /= outer_norm
 
     n = result.shape[0]
     idx = xp.arange(n)
@@ -355,5 +373,10 @@ def factorise_chunked(
     del sum_real, sum_perm, ss_real, ss_perm
 
     mean, sd = get_dstat(perm_corr, xp)
-    zscores = (corr - mean[None, :]) / sd[None, :]
-    return xp.where(xp.isnan(zscores), 0.0, zscores)
+    # In place, reusing corr's buffer as zscores instead of allocating a new
+    # (genes x genes) array -- see _angles_from_moments's docstring.
+    zscores = corr
+    zscores -= mean[None, :]
+    zscores /= sd[None, :]
+    xp.nan_to_num(zscores, copy=False, nan=0.0)
+    return zscores
