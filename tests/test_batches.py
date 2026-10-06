@@ -7,6 +7,7 @@ from scipy import sparse as sp
 
 from pyanglemania.datasets import example_adata
 from pyanglemania.preprocessing._batches import (
+    lognorm_column_sums,
     add_unique_batch_key,
     align_to_common_genes,
     compute_dataset_weights,
@@ -110,3 +111,17 @@ def test_align_to_common_genes_reorders():
     out = align_to_common_genes(X, ["a", "b"], ["b", "a"], np)
     expected = np.array([[2.0, 1.0], [4.0, 3.0]])
     np.testing.assert_array_equal(out, expected)
+
+
+def test_lognorm_column_sums_matches_scanpy_and_sparse():
+    import scanpy as sc
+    from anndata import AnnData
+    rng = np.random.default_rng(0)
+    X = rng.poisson(1, size=(50, 8)).astype(np.float32)
+    X[0] = 0
+    ad = AnnData(X.copy())
+    sc.pp.normalize_total(ad, target_sum=1e4)
+    sc.pp.log1p(ad)
+    expected = ad.X.sum(axis=0)
+    np.testing.assert_allclose(lognorm_column_sums(X, np, sp), expected, rtol=1e-6)
+    np.testing.assert_allclose(lognorm_column_sums(sp.csc_matrix(X), np, sp), expected, rtol=1e-6)

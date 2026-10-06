@@ -3,13 +3,19 @@
 Ported from anglemania's R ``anglemania()`` (``R/anglemania.R``), restructured
 around ``AnnData`` and streaming cross-batch statistics instead of
 file-backed per-batch matrices -- see ``_stats.py`` for that part. The
-public surface (parameter names/values, the two-pass prefilter-then-rank
-selection) is kept faithful to the R function so results are comparable.
+per-batch angle/z-score computation and its parameters are kept faithful to
+the R function; the selection step is not. R ranks *gene pairs* and takes
+unique genes from the top pairs, so a gene's effective score is the rank of
+the single best pair it is in. Here every gene instead gets a row-sum score
+over all its partners (``signal``/``noise``/``R``, see ``_stats.py``),
+corrected for expression by within-bin z-scoring (``_gene_level.py``), and
+genes are ranked on that directly.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 from .._utils import get_array_module, vmessage
 from ._angles import factorise, factorise_chunked
@@ -17,12 +23,18 @@ from ._batches import (
     add_unique_batch_key,
     align_to_common_genes,
     compute_dataset_weights,
+    genes_in_every_dataset,
     genes_passing_min_cells,
     intersect_genes,
+    lognorm_column_sums,
     split_obs_indices_by_batch,
 )
-from ._select import extract_unique_genes, prefilter_gene_pairs, rank_gene_pairs
+from ._gene_level import binned_zscores, top_genes
 from ._stats import StreamingZscoreStats
+
+# `score` value -> the per-gene column (in ``binned_zscores``' output) genes are ranked on
+_SCORES = {"R": "R_z_binned", "WSN": "WSN", "ICC": "ICC_db_z_binned"}
+_MISSING_MODES = ("mask", "zero")
 
 
 def _check_params(
@@ -33,12 +45,14 @@ def _check_params(
     method,
     min_cells_per_gene,
     min_samples_per_gene,
+    missing_mode,
+    dataset_presence,
     permute_row_or_column,
     permutation_function,
-    prefilter_threshold,
     normalization_method,
-    score_weights,
-    direction,
+    score,
+    n_bins,
+    signal_R_weights,
     cell_chunk_size,
 ):
     if batch_key not in adata.obs.columns:
@@ -53,6 +67,10 @@ def _check_params(
         raise ValueError("min_cells_per_gene must be >= 1")
     if min_samples_per_gene < 1:
         raise ValueError("min_samples_per_gene must be >= 1")
+    if missing_mode not in _MISSING_MODES:
+        raise ValueError(f"missing_mode must be one of {_MISSING_MODES}, got {missing_mode!r}")
+    if dataset_presence and dataset_key is None:
+        raise ValueError("dataset_presence=True needs a dataset_key")
     if permute_row_or_column not in ("row", "column"):
         raise ValueError(
             f"permute_row_or_column must be 'row' or 'column', got {permute_row_or_column!r}"
@@ -62,19 +80,17 @@ def _check_params(
             "permutation_function must be 'sample' or 'permute_nonzero', "
             f"got {permutation_function!r}"
         )
-    if prefilter_threshold <= 0:
-        raise ValueError("prefilter_threshold must be positive")
     if normalization_method not in ("divide_by_total_counts", "find_residuals", "pflog1ppf"):
         raise ValueError(
             "normalization_method must be 'divide_by_total_counts', "
             f"'find_residuals' or 'pflog1ppf', got {normalization_method!r}"
         )
-    if score_weights is not None and (
-        len(score_weights) != 2 or not all(0 <= w <= 1 for w in score_weights)
-    ):
-        raise ValueError("score_weights must be a length-2 sequence of values in [0, 1]")
-    if direction not in ("both", "anticor", "cor"):
-        raise ValueError(f"direction must be 'both', 'anticor' or 'cor', got {direction!r}")
+    if score not in _SCORES:
+        raise ValueError(f"score must be one of {tuple(_SCORES)}, got {score!r}")
+    if not isinstance(n_bins, int) or n_bins < 1:
+        raise ValueError("n_bins must be a positive integer")
+    if len(signal_R_weights) != 2 or not all(w >= 0 for w in signal_R_weights):
+        raise ValueError("signal_R_weights must be a length-2 sequence of non-negative values")
     if cell_chunk_size is not None and (
         not isinstance(cell_chunk_size, int) or cell_chunk_size < 1
     ):
@@ -91,14 +107,16 @@ def anglemania(
     min_cells_per_gene: int = 1,
     min_samples_per_gene: int = 2,
     allow_missing_features: bool = False,
+    missing_mode: str = "mask",
+    dataset_presence: bool = False,
     method: str = "cosine",
     permute_row_or_column: str = "column",
     permutation_function: str = "sample",
-    prefilter_threshold: float = 0.5,
     do_normalize: bool = True,
     normalization_method: str = "divide_by_total_counts",
-    score_weights: tuple[float, float] = (0.4, 0.6),
-    direction: str = "both",
+    score: str = "R",
+    n_bins: int = 20,
+    signal_R_weights: tuple[float, float] = (0.5, 0.5),
     cell_chunk_size: int | None = None,
     verbose: bool = True,
 ):
@@ -108,19 +126,58 @@ def anglemania(
     computes the gene-gene angle (correlation) matrix on ``adata.X`` (or
     ``layer``, expected to hold raw counts) and z-scores it against a
     permuted null built from that same batch. Those per-batch z-score
-    matrices are then reduced, batch by batch, into a weighted mean/sd/SNR
-    across batches (kept as a running accumulator rather than ever holding
-    every batch's matrix at once -- see :class:`._stats.StreamingZscoreStats`),
-    and genes are selected from the gene pairs with the most consistently
-    extreme angles across batches.
+    matrices are then reduced, batch by batch, into a weighted cross-batch
+    mean ``M`` and sd ``S`` per gene pair (kept as a running accumulator
+    rather than ever holding every batch's matrix at once -- see
+    :class:`._stats.StreamingZscoreStats`), and from there into one score
+    per gene:
 
-    Parameters mirror anglemania's R function of the same name; see
-    ``ref_packages/anglemania/R/anglemania.R`` for the original. Two
+    - ``signal = sum_j M_ij^2``: how strongly the gene's angles to all
+      other genes are reproduced across batches;
+    - ``noise = sum_j S_ij^2``: how much of them is batch-specific;
+    - ``R = signal / (signal + noise)``: the reproducible fraction.
+
+    ``log10(signal)`` and ``R`` are z-scored within equal-frequency bins of
+    mean log-normalized expression (``n_bins``), giving ``signal_z_binned``
+    and ``R_z_binned``, and the weighted signal/noise score ``WSN =
+    signal_R_weights[0] * signal_z_binned + signal_R_weights[1] *
+    R_z_binned``. The ``max_n_genes`` genes with the highest ``score`` are
+    selected: ``"R"`` (default) ranks on ``R_z_binned``, ``"WSN"`` on
+    ``WSN``, ``"ICC"`` on ``ICC_db_z_binned`` (see below).
+
+    The per-batch parameters mirror anglemania's R function of the same
+    name; see ``ref_packages/anglemania/R/anglemania.R`` for the original.
+    R's pair-level selection parameters (``prefilter_threshold``,
+    ``score_weights``, ``direction``) have no gene-level counterpart and
+    are gone -- the row sums are sums of squares, hence sign-blind. Two
     ``method``/``normalization_method`` choices are not from R:
     ``method="phi_s"`` (a proportionality metric in place of correlation)
     and ``normalization_method="pflog1ppf"`` (a shifted-CLR transform,
     intended to be used together) -- see ``_angles.py``'s
     ``extract_angles``/``normalize_matrix`` docstrings.
+
+    **Missing genes** (``allow_missing_features=True``: a gene is kept if it
+    passes ``min_cells_per_gene`` in at least ``min_samples_per_gene``
+    batches). With ``missing_mode="mask"`` (default, not from R), each
+    batch's angles and permutation null are computed on the genes present
+    in that batch only, and each gene pair is reduced over the batches in
+    which both genes are present. ``missing_mode="zero"`` is R's behavior
+    instead -- absent genes are zero-padded columns (which also enter the
+    batch's permutation null) whose z-scores of 0 are averaged in with full
+    weight, shrinking ``M`` and inflating ``S`` in proportion to how often a
+    gene is missing (see ``plans/missing_features_nan_masking.md``).
+
+    Masked, each pair also has its own ``kappa = sum w^2 / (sum w)^2`` over
+    its shared batches, and ``R``'s pure-noise floor is ``~kappa`` -- so
+    ``R`` (and ``R_z_binned``, ``WSN``) is inflated for genes present in
+    fewer batches. ``score="ICC"`` ranks on the binned
+    debiased ``ICC_db = sum_j (M^2 - kappa S^2) / (sum_j (M^2 - kappa S^2)
+    + noise)`` instead, whose null is ~0 at every presence level (without
+    missing genes it is a monotone transform of ``R``, so it ranks genes
+    within each bin as ``R_z_binned`` does).
+    ``dataset_presence=True`` additionally requires a gene to be present in
+    at least one batch of every ``dataset_key`` group, which guards against
+    annotation gaps (a gene with zero counts across a whole dataset).
 
     ``cell_chunk_size`` (not from R): if given, each batch's angle
     computation is done in row-chunks of at most this many cells instead of
@@ -138,9 +195,14 @@ def anglemania(
     Modifies ``adata`` in place:
 
     - ``adata.var["anglemania_genes"]``: boolean mask of selected genes.
+    - ``adata.var["anglemania_{signal,noise,R,signal_db,ICC_db,mean_lognorm,
+      n_batches_present,expr_bin,signal_z_binned,R_z_binned,WSN,
+      ICC_db_z_binned}"]``: the per-gene scores and their inputs; NaN for
+      genes outside ``intersect_genes``.
     - ``adata.uns["anglemania"]``: dict with ``params``, ``intersect_genes``,
-      ``prefiltered_df`` (ranked gene-pair statistics), and
-      ``anglemania_genes``.
+      ``anglemania_genes`` (selected genes, best first), and ``presence``
+      (``batches x intersect_genes`` boolean DataFrame; pair counts ``n_ij``
+      are ``presence.T @ presence``).
     - **GPU only, sparse input only**: once every batch's cells have been
       partitioned out of ``adata.X``/``adata.layers[layer]`` (the input is
       no longer read after that point), that layer is replaced with an
@@ -162,12 +224,14 @@ def anglemania(
         method,
         min_cells_per_gene,
         min_samples_per_gene,
+        missing_mode,
+        dataset_presence,
         permute_row_or_column,
         permutation_function,
-        prefilter_threshold,
         normalization_method,
-        score_weights,
-        direction,
+        score,
+        n_bins,
+        signal_R_weights,
         cell_chunk_size,
     )
 
@@ -175,6 +239,8 @@ def anglemania(
     add_unique_batch_key(adata, batch_key, dataset_key)
     weights = compute_dataset_weights(adata.obs, batch_key, dataset_key)
     batch_indices = split_obs_indices_by_batch(adata)
+    if len(batch_indices) < 2:
+        raise ValueError("anglemania needs at least 2 batches")
 
     X_full = adata.X if layer is None else adata.layers[layer]
     xp, sp_mod = get_array_module(X_full)
@@ -230,6 +296,13 @@ def anglemania(
     common_genes = intersect_genes(
         list(batch_genes.values()), allow_missing_features, min_samples_per_gene, verbose
     )
+    if dataset_presence and allow_missing_features:
+        info = adata.obs[["anglemania_batch", dataset_key]].drop_duplicates()
+        batch_dataset = dict(
+            zip(info["anglemania_batch"].astype(str), info[dataset_key].astype(str))
+        )
+        common_genes = genes_in_every_dataset(common_genes, batch_genes, batch_dataset)
+        vmessage(verbose, f"Number of genes present in every dataset: {len(common_genes)}")
     if max_n_genes is not None and max_n_genes > len(common_genes):
         vmessage(
             verbose,
@@ -239,13 +312,27 @@ def anglemania(
         max_n_genes = len(common_genes)
 
     vmessage(verbose, "Computing angles and transforming to z-scores...")
+    gene_pos = {g: i for i, g in enumerate(common_genes)}
     stats = StreamingZscoreStats(len(common_genes))
+    lognorm_sum = np.zeros(len(common_genes))
+    n_present = np.zeros(len(common_genes), dtype=np.int64)
+    mask = missing_mode == "mask"
     for label, idx in batch_indices.items():
+        src = [i for i, g in enumerate(batch_genes[label]) if g in gene_pos]
+        dst = np.asarray([gene_pos[batch_genes[label][i]] for i in src], dtype=np.int64)
+        n_present[dst] += 1
+        lognorm_sum[dst] += lognorm_column_sums(batch_X[label][:, np.asarray(src)], xp, sp_mod)
+
+        # Masked: the batch's z-scores cover its present genes only (in
+        # universe order), so no zero-padded column enters its null either.
+        # Zero: the full universe, absent genes zero-padded, as in R.
+        index = np.sort(dst) if mask else None
+        z_genes = [common_genes[i] for i in index] if mask else common_genes
         if cell_chunk_size is not None:
             zscores = factorise_chunked(
                 batch_X[label],
                 batch_genes[label],
-                common_genes,
+                z_genes,
                 xp,
                 cell_chunk_size,
                 method=method,
@@ -255,7 +342,7 @@ def anglemania(
                 do_normalize=do_normalize,
             )
         else:
-            X_dense = align_to_common_genes(batch_X[label], batch_genes[label], common_genes, xp)
+            X_dense = align_to_common_genes(batch_X[label], batch_genes[label], z_genes, xp)
             zscores = factorise(
                 X_dense,
                 xp,
@@ -266,54 +353,40 @@ def anglemania(
                 do_normalize=do_normalize,
             )
             del X_dense
-        stats.update(zscores, float(weights[label]))
+        stats.update(zscores, float(weights[label]), index)
         del zscores
-
-    # batch_X (every batch's own reduced partition) is never read again past
-    # this point either -- same redundancy as X_full above, just discovered
-    # later: on GPU it was staying resident through the entire prefilter/
-    # rank/select stage below, on top of forcing that stage itself onto CPU
-    # (mean_zscore/sds_zscore/sn_zscore come back from the host-resident
-    # StreamingZscoreStats as plain numpy now, so prefilter_gene_pairs/
-    # rank_gene_pairs -- which infer their backend from *that* input --
-    # always ran on CPU regardless of --gpu, silently losing the ~13x
-    # on-device speedup plans/optimization.md #6d measured for this stage).
-    # Freeing batch_X and moving the z-score matrices back to GPU here
-    # restores that speedup; by this point X_full and batch_X together were
-    # the dominant GPU consumers, so there's ample room for three more
-    # (genes x genes) arrays.
     del batch_X
 
-    vmessage(verbose, "Computing statistics...")
-    mean_zscore, sds_zscore, sn_zscore = stats.finalize()
-    if xp.__name__ == "cupy":
-        mean_zscore = xp.asarray(mean_zscore)
-        sds_zscore = xp.asarray(sds_zscore)
-        sn_zscore = xp.asarray(sn_zscore)
-
-    vmessage(verbose, "Pre-filtering features...")
-    prefiltered = prefilter_gene_pairs(
-        mean_zscore,
-        sds_zscore,
-        sn_zscore,
-        zscore_mean_threshold=prefilter_threshold,
-        zscore_sn_threshold=prefilter_threshold,
-        verbose=verbose,
+    vmessage(verbose, "Computing gene-level scores...")
+    gene_scores = stats.gene_scores()
+    presence = pd.DataFrame(stats.presence, index=list(batch_indices), columns=common_genes)
+    del stats
+    mean_lognorm = lognorm_sum / sum(len(idx) for idx in batch_indices.values())
+    binned = binned_zscores(
+        mean_lognorm,
+        gene_scores["signal"],
+        gene_scores["R"],
+        ICC_db=gene_scores["ICC_db"],
+        n_bins=n_bins,
+        signal_R_weights=signal_R_weights,
     )
+    selected_genes = top_genes(binned[_SCORES[score]].to_numpy(), common_genes, max_n_genes)
 
-    vmessage(verbose, "Extracting filtered features...")
-    ranked = rank_gene_pairs(prefiltered, score_weights=score_weights, direction=direction)
-    common_genes_arr = np.asarray(common_genes)
-    selected_genes = extract_unique_genes(ranked, common_genes_arr, max_n_genes)
-
-    # geneA/geneB strings are looked up once here, on the already-ranked
-    # table, instead of before ranking/sorting -- see prefilter_gene_pairs's
-    # docstring (plans/optimization.md #6).
-    prefiltered_df = ranked.assign(
-        geneA=common_genes_arr[ranked["geneA_idx"].to_numpy()],
-        geneB=common_genes_arr[ranked["geneB_idx"].to_numpy()],
-    )[["geneA", "geneB", "mean_zscore", "sd_zscore", "sn_zscore", "rank"]]
-
+    columns = {
+        "signal": gene_scores["signal"],
+        "noise": gene_scores["noise"],
+        "R": gene_scores["R"],
+        "signal_db": gene_scores["signal_db"],
+        "ICC_db": gene_scores["ICC_db"],
+        "mean_lognorm": mean_lognorm,
+        "n_batches_present": n_present,
+        **{c: binned[c].to_numpy() for c in binned.columns},
+    }
+    pos = adata.var_names.get_indexer(common_genes)
+    for name, values in columns.items():
+        col = np.full(adata.n_vars, np.nan)
+        col[pos] = values
+        adata.var[f"anglemania_{name}"] = col
     adata.var["anglemania_genes"] = adata.var_names.isin(selected_genes)
     adata.uns["anglemania"] = {
         "params": {
@@ -323,19 +396,21 @@ def anglemania(
             "min_cells_per_gene": min_cells_per_gene,
             "min_samples_per_gene": min_samples_per_gene,
             "allow_missing_features": allow_missing_features,
+            "missing_mode": missing_mode,
+            "dataset_presence": dataset_presence,
             "method": method,
             "permute_row_or_column": permute_row_or_column,
             "permutation_function": permutation_function,
-            "prefilter_threshold": prefilter_threshold,
             "do_normalize": do_normalize,
             "normalization_method": normalization_method,
-            "score_weights": list(score_weights),
-            "direction": direction,
+            "score": score,
+            "n_bins": n_bins,
+            "signal_R_weights": list(signal_R_weights),
             "cell_chunk_size": cell_chunk_size,
         },
         "intersect_genes": common_genes,
-        "prefiltered_df": prefiltered_df.reset_index(drop=True),
         "anglemania_genes": selected_genes,
+        "presence": presence,
     }
     vmessage(verbose, f"Selected {len(selected_genes)} genes for integration.")
     return adata

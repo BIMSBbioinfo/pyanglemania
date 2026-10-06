@@ -24,15 +24,16 @@ pytestmark = pytest.mark.skipif(not _has_gpu, reason="no reachable CUDA device")
 import cupyx.scipy.sparse as csp  # noqa: E402
 
 import pyanglemania as pa  # noqa: E402
-from pyanglemania.datasets import example_adata  # noqa: E402
 from pyanglemania.preprocessing._angles import (  # noqa: E402
     extract_angles,
     factorise_chunked,
     get_dstat,
     normalize_matrix,
 )
-from pyanglemania.preprocessing._batches import genes_passing_min_cells  # noqa: E402
-from pyanglemania.preprocessing._select import prefilter_gene_pairs, rank_gene_pairs  # noqa: E402
+from pyanglemania.preprocessing._batches import (  # noqa: E402
+    genes_passing_min_cells,
+    lognorm_column_sums,
+)
 from pyanglemania.preprocessing._stats import StreamingZscoreStats  # noqa: E402
 
 
@@ -80,65 +81,26 @@ def test_get_dstat_matches_numpy():
 
 
 def test_streaming_stats_accepts_cupy_batches_same_as_numpy():
-    # StreamingZscoreStats accumulators are always host (numpy) now (fix 1 of
+    # StreamingZscoreStats accumulators are always host (numpy) (fix 1 of
     # plans/gpu_memory_large_batches.md) -- update() must transparently pull a
     # cupy batch to host, giving the identical result as feeding the same
     # values in as numpy from the start.
     rng = np.random.default_rng(3)
     n_genes = 15
     zscores = [rng.normal(size=(n_genes, n_genes)) for _ in range(4)]
-    for z in zscores:
-        np.fill_diagonal(z, 0.0)
+    present = [rng.random(n_genes) > 0.2 for _ in range(4)]
     weights = [0.7, 1.1, 1.0, 1.4]
 
     st_np = StreamingZscoreStats(n_genes)
     st_cp = StreamingZscoreStats(n_genes)
-    for z, w in zip(zscores, weights):
-        st_np.update(z, w)
-        st_cp.update(cp.asarray(z), w)
-    mean_np, sd_np, sn_np = st_np.finalize()
-    mean_cp, sd_cp, sn_cp = st_cp.finalize()
-    assert isinstance(mean_cp, np.ndarray)
-    off_diag = ~np.eye(n_genes, dtype=bool)
-    np.testing.assert_allclose(mean_np, mean_cp)
-    np.testing.assert_allclose(sd_np[off_diag], sd_cp[off_diag])
-    np.testing.assert_allclose(sn_np[off_diag], sn_cp[off_diag])
-
-
-def test_rank_gene_pairs_cupy_native_path_matches_pandas():
-    # Continuous random data makes exact ties between pairs essentially
-    # impossible, so row order (not just rank *values*) should agree
-    # exactly between the cupy-native (sort+searchsorted) and pandas
-    # rank() implementations -- see _select.py::_min_rank and
-    # plans/optimization.md #6d for why these are two different code
-    # paths in the first place (pandas wins on CPU, cupy-native wins on
-    # GPU at scale).
-    n = 60
-    rng = np.random.default_rng(7)
-    mean_np = rng.normal(size=(n, n))
-    sd_np = np.abs(rng.normal(size=(n, n))) + 0.1
-    sn_np = np.abs(rng.normal(size=(n, n))) + 0.1
-    mean_cp, sd_cp, sn_cp = cp.asarray(mean_np), cp.asarray(sd_np), cp.asarray(sn_np)
-
-    for direction in ("both", "anticor", "cor"):
-        pre_np = prefilter_gene_pairs(mean_np, sd_np, sn_np, zscore_mean_threshold=0.1,
-                                       zscore_sn_threshold=0.1, verbose=False)
-        ranked_np = rank_gene_pairs(pre_np, score_weights=(0.4, 0.6), direction=direction)
-
-        pre_cp = prefilter_gene_pairs(mean_cp, sd_cp, sn_cp, zscore_mean_threshold=0.1,
-                                       zscore_sn_threshold=0.1, verbose=False)
-        ranked_cp = rank_gene_pairs(pre_cp, score_weights=(0.4, 0.6), direction=direction)
-
-        np.testing.assert_array_equal(
-            ranked_np["geneA_idx"].to_numpy(), ranked_cp["geneA_idx"].to_numpy()
-        )
-        np.testing.assert_array_equal(
-            ranked_np["geneB_idx"].to_numpy(), ranked_cp["geneB_idx"].to_numpy()
-        )
-        np.testing.assert_allclose(
-            ranked_np["rank"].to_numpy(), ranked_cp["rank"].to_numpy()
-        )
-        assert ranked_cp["rank"].is_monotonic_increasing
+    for z, w, p in zip(zscores, weights, present):
+        idx = np.flatnonzero(p)
+        st_np.update(z[np.ix_(idx, idx)], w, idx)
+        st_cp.update(cp.asarray(z[np.ix_(idx, idx)]), w, idx)
+    got_np, got_cp = st_np.gene_scores(), st_cp.gene_scores()
+    for k in ("signal", "noise", "R", "signal_db", "ICC_db"):
+        assert isinstance(got_cp[k], np.ndarray)
+        np.testing.assert_allclose(got_np[k], got_cp[k])
 
 
 def test_genes_passing_min_cells_sparse_gpu():
@@ -161,8 +123,9 @@ def test_anglemania_runs_on_gpu_backed_adata(sparse):
     pa.pp.anglemania(adata, batch_key="batch", dataset_key="dataset", max_n_genes=15, verbose=False)
 
     assert adata.var["anglemania_genes"].sum() == 15
-    df = adata.uns["anglemania"]["prefiltered_df"]
-    assert np.isfinite(df[["mean_zscore", "sd_zscore", "sn_zscore"]].to_numpy()).all()
+    scored = adata.var.loc[adata.uns["anglemania"]["intersect_genes"]]
+    assert np.isfinite(scored[["anglemania_signal", "anglemania_R",
+                               "anglemania_WSN"]].to_numpy()).all()
 
 
 def test_anglemania_runs_on_gpu_backed_adata_with_phi_s():
@@ -180,8 +143,9 @@ def test_anglemania_runs_on_gpu_backed_adata_with_phi_s():
     )
 
     assert adata.var["anglemania_genes"].sum() == 15
-    df = adata.uns["anglemania"]["prefiltered_df"]
-    assert np.isfinite(df[["mean_zscore", "sd_zscore", "sn_zscore"]].to_numpy()).all()
+    scored = adata.var.loc[adata.uns["anglemania"]["intersect_genes"]]
+    assert np.isfinite(scored[["anglemania_signal", "anglemania_R",
+                               "anglemania_WSN"]].to_numpy()).all()
 
 
 @pytest.mark.parametrize(
@@ -228,8 +192,9 @@ def test_anglemania_cell_chunk_size_runs_on_gpu_sparse():
     )
 
     assert adata.var["anglemania_genes"].sum() == 15
-    df = adata.uns["anglemania"]["prefiltered_df"]
-    assert np.isfinite(df[["mean_zscore", "sd_zscore", "sn_zscore"]].to_numpy()).all()
+    scored = adata.var.loc[adata.uns["anglemania"]["intersect_genes"]]
+    assert np.isfinite(scored[["anglemania_signal", "anglemania_R",
+                               "anglemania_WSN"]].to_numpy()).all()
 
 
 def test_anglemania_cell_chunk_size_gpu_single_chunk_matches_unchunked():
@@ -248,3 +213,40 @@ def test_anglemania_cell_chunk_size_gpu_single_chunk_matches_unchunked():
     assert list(unchunked.uns["anglemania"]["anglemania_genes"]) == list(
         chunked.uns["anglemania"]["anglemania_genes"]
     )
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_lognorm_column_sums_matches_numpy(sparse):
+    # (End-to-end CPU/GPU scores aren't comparable: cupy's and numpy's
+    # default_rng draw different permutations, hence different nulls.)
+    from scipy import sparse as sp
+
+    rng = np.random.default_rng(5)
+    X_np = rng.poisson(1, size=(120, 25)).astype(np.float32)
+    X_np[3] = 0  # an all-zero cell
+    X_cp = cp.asarray(X_np)
+    if sparse:
+        X_np, X_cp = sp.csr_matrix(X_np), csp.csr_matrix(X_cp)
+    got_np = lognorm_column_sums(X_np, np, sp)
+    got_cp = lognorm_column_sums(X_cp, cp, csp)
+    assert isinstance(got_cp, np.ndarray)
+    np.testing.assert_allclose(got_np, got_cp, rtol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ["mask", "zero"])
+def test_anglemania_missing_modes_run_on_gpu_sparse(mode):
+    adata = pa.datasets.example_adata()
+    adata.obs["batch"] = (
+        adata.obs["batch"].astype(str) + "_" + (np.arange(adata.n_obs) % 2).astype(str)
+    ).astype("category")
+    X = adata.X.copy()
+    rng = np.random.default_rng(0)
+    for b in adata.obs["batch"].cat.categories:
+        X[np.ix_((adata.obs["batch"] == b).to_numpy(), rng.choice(adata.n_vars, 60, False))] = 0
+    adata.X = csp.csr_matrix(cp.asarray(X))
+    pa.pp.anglemania(adata, batch_key="batch", allow_missing_features=True,
+                     missing_mode=mode, cell_chunk_size=97, max_n_genes=15, verbose=False)
+    assert adata.var["anglemania_genes"].sum() == 15
+    scored = adata.var.loc[adata.uns["anglemania"]["intersect_genes"]]
+    assert (scored["anglemania_n_batches_present"] < 4).any()
+    assert np.isfinite(scored[["anglemania_ICC_db", "anglemania_WSN"]].to_numpy()).all()

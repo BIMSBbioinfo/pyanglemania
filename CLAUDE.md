@@ -4,6 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
+**Since 0.1.1 the selection is gene-level, not pair-level** (see step 4–5 below): R's
+`prefilter_gene_pairs`/`rank_gene_pairs`/`extract_unique_genes` (`_select.py`) and the
+`prefilter_threshold`/`score_weights`/`direction` parameters were removed. The design and the
+experiments behind it live outside this repo, in
+`~/projects/CRC1588/dataset_integration/anglemania_analysis/tasks/nmf/docs/tasks/`
+(`pergene_score_into_pyanglemania.md`, `pergene_signal_noise_R_axes.md`,
+`permutation_null_necessity.md`); the package reproduces that task's `gene_scores.py` +
+`add_binned_zscores` (`R_z_binned`, and `score_binned`, called `WSN` here) to float32 precision. Benchmark numbers in
+"Scaling" below that mention the prefilter/rank/extract stages are from before that change.
+
 The core port is implemented and tested on CPU (numpy/scipy). What exists:
 
 - `src/pyanglemania/` — the package (see Architecture below).
@@ -133,10 +143,28 @@ Read `anglemania.R`, `compute_angles.R`, `stats.R`, `select_genes.R`, `prepare_a
    - Normalize both the real and permuted matrices (`normalize_matrix`: default `"divide_by_total_counts"` = CP10K + log1p; alternate `"find_residuals"` regresses out log total counts per gene. Note R's docs also mention a third choice, `"scale_by_total_counts"`, but R's own `normalize_matrix` never implements it — only these two are ported from R as-is. A third, non-R choice, `"pflog1ppf"`, was added later — see "Extensions beyond the R port" below).
    - Gene-gene relationship matrix for both (`extract_angles`: Pearson correlation across cells, i.e. the "angle" between mean-centered gene vectors; `"spearman"` ranks first — ties broken by original order rather than R's tie-averaging, to keep this vectorized on both numpy and cupy). Diagonal is NaN. A third, non-R `method`, `"phi_s"`, was added later — see below.
    - Per-gene (per-column) `mean`/`sd` of the **permuted** matrix (`get_dstat`), then z-score the **real** matrix against that null. This makes the z-score matrix asymmetric (entry `(i, j)` is standardized against gene `j`'s own null, not gene `i`'s) — intentional, matches R, and only the upper triangle is read downstream anyway.
-4. **Cross-batch reduction** (`stats.R::get_list_stats` → `_stats.py::StreamingZscoreStats`): weighted `mean_zscore`, weighted `sds_zscore`, and `sn_zscore = |mean| / sd` per gene pair, accumulated batch-by-batch instead of from a list of all batches' matrices (the core streaming deviation; see the module docstring for the single-pass identity this relies on).
-5. **Prefilter + select** (`select_genes.R` → `_select.py`): keep gene pairs whose `|mean_zscore|` and `sn_zscore` both clear a threshold, auto-relaxed by -0.1 if nothing passes (`prefilter_gene_pairs`); rank by a weighted combination of rank(|mean z-score|) and rank(sd z-score) (`score_weights`, default `(0.4, 0.6)` favors sd; `rank_gene_pairs`); take unique genes from the top-ranked pairs up to `max_n_genes` (`extract_unique_genes`). Results land in `adata.var["anglemania_genes"]` / `adata.uns["anglemania"]`.
+4. **Cross-batch reduction** (`stats.R::get_list_stats` → `_stats.py::StreamingZscoreStats`) — **no longer R's output**, see below. Originally: weighted `mean_zscore`, weighted `sds_zscore`, and `sn_zscore = |mean| / sd` per gene pair, accumulated batch-by-batch instead of from a list of all batches' matrices (the core streaming deviation; see the module docstring for the single-pass identity this relies on).
+   Now: each per-batch z matrix is symmetrised (`(z + zᵀ)/2`) on the way in, then reduced to one
+   row per gene (`gene_scores()`, row-chunked, never materialising `M`/`S`): `signal = Σⱼ M_ij²`,
+   `noise = Σⱼ S_ij²`, `R = signal / (signal + noise)`. With `allow_missing_features=True` a pair
+   only uses the batches where both genes are present (per-pair weights `W1 = Pᵀ diag(w) P` from the
+   per-batch presence vectors, not accumulated); row sums are rescaled by `(p−1)/n_valid`. With
+   `missing_mode="mask"` (default) each batch's z (angles *and* permutation null) is computed on its
+   present genes only and handed to `update(z, w, index)` as a `(q, q)` block; `missing_mode="zero"`
+   is R's zero-padding + full-weight averaging (`plans/missing_features_nan_masking.md`). Masked,
+   κ = ΣW²/(ΣW)² differs per pair and `R`'s null floor is ≈κ, so `R` is inflated for genes in fewer
+   batches; `signal_db = Σⱼ (M² − κ S²)` / `ICC_db` are the debiased versions (`ICC_db_z_binned`,
+   selectable via `score="ICC"`). `dataset_presence=True` keeps only genes present in ≥ 1 batch of every
+   `dataset_key` group.
+5. **Expression-binned selection** (no R counterpart → `_gene_level.py`): `log10 signal` and `R` are
+   z-scored within `n_bins` equal-frequency bins of mean CP10K+log1p expression (accumulated per
+   batch during the loop, `_batches.py::lognorm_column_sums`), `WSN = signal_R_weights[0] ·
+   signal_z_binned + signal_R_weights[1] · R_z_binned`, and the top `max_n_genes` by `score`
+   (`score="R"` → `R_z_binned`, the default; `"WSN"`; `"ICC"` → `ICC_db_z_binned`) are selected. Per-gene columns land in
+   `adata.var["anglemania_*"]`; `adata.uns["anglemania"]` holds `params`, `intersect_genes`,
+   `anglemania_genes`.
 
-All public parameters from R's `anglemania()`/`check_params` are preserved with the same names/values: `batch_key`, `dataset_key`, `max_n_genes`, `min_cells_per_gene`, `min_samples_per_gene`, `allow_missing_features`, `method`, `permute_row_or_column`, `permutation_function`, `prefilter_threshold`, `do_normalize`, `normalization_method`, `score_weights`, `direction`. (`layer` is new, since AnnData has no exact equivalent of R's fixed `counts()` accessor.)
+R's per-batch parameters from `anglemania()`/`check_params` are preserved with the same names/values: `batch_key`, `dataset_key`, `max_n_genes`, `min_cells_per_gene`, `min_samples_per_gene`, `allow_missing_features`, `method`, `permute_row_or_column`, `permutation_function`, `do_normalize`, `normalization_method`. R's pair-level `prefilter_threshold`/`score_weights`/`direction` are gone (the gene-level sums are sums of squares, hence sign-blind; `direction` has no analogue). New: `layer` (AnnData has no exact equivalent of R's fixed `counts()` accessor), `score`, `n_bins`, `signal_R_weights` (deliberately not reusing the name `score_weights`), `missing_mode`, `dataset_presence`, `cell_chunk_size`.
 
 ## Extensions beyond the R port
 
@@ -171,8 +199,8 @@ two additions only):
 Both compose with the rest of the pipeline (permutation, per-batch z-scoring, cross-batch streaming
 reduction, prefilter/rank/select) unmodified, since they preserve the existing function contracts:
 `normalize_matrix` still returns a `(cells x genes)` array, `extract_angles` still returns a
-symmetric `(genes x genes)` array with NaN diagonal. No changes were needed to `_stats.py`/
-`_select.py`. Tested for CPU/GPU parity the same way as the R-ported choices (`tests/test_angles.py`,
+symmetric `(genes x genes)` array with NaN diagonal. No changes were needed to the
+cross-batch reduction or selection. Tested for CPU/GPU parity the same way as the R-ported choices (`tests/test_angles.py`,
 `tests/test_gpu.py`).
 
 ## Architecture
@@ -186,8 +214,8 @@ src/pyanglemania/
     _anglemania.py             # orchestrator + parameter validation (the public pp.anglemania entry point)
     _batches.py                  # batch/dataset weighting, gene filtering/intersection, zero-padding
     _angles.py                    # normalize_matrix, permute_matrix, extract_angles, factorise
-    _stats.py                      # StreamingZscoreStats (the streaming cross-batch reduction)
-    _select.py                      # prefilter_gene_pairs, rank_gene_pairs, extract_unique_genes
+    _stats.py                      # StreamingZscoreStats (streaming cross-batch reduction -> per-gene signal/noise/R)
+    _gene_level.py                  # binned_zscores (expression-binned R_z_binned/WSN/ICC_db_z_binned), top_genes
 ```
 
 Nothing in this package moves data to the GPU itself — like `rapids-singlecell`, it dispatches to numpy or cupy based on whatever array `adata.X` (or `layer`) already holds (e.g. after `rapids_singlecell.get.anndata_to_GPU(adata)`). `get_array_module` in `_utils.py` is the single place that decides this; every other function takes an explicit `xp` parameter rather than importing numpy/cupy itself.

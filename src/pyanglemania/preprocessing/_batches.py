@@ -132,3 +132,37 @@ def align_to_common_genes(X, batch_genes: list[str], common_genes: list[str], xp
         dense = to_dense(X[:, np.asarray(src_cols)], xp).astype(xp.float32)
         out[:, np.asarray(dst_cols)] = dense
     return out
+
+
+def lognorm_column_sums(X, xp, sp_mod, target_sum: float = 1e4) -> np.ndarray:
+    """Per-gene sum over cells of ``log1p(target_sum * x / cell_total)``, as host float64.
+
+    The CP10K + log1p expression covariate the gene-level scores are binned
+    on, computed over whatever columns ``X`` has (cell totals included), so
+    pass it the batch already restricted to the scored genes. All-zero cells
+    contribute 0. Stays sparse for sparse ``X``.
+    """
+    totals = xp.asarray(X.sum(axis=1), dtype=xp.float64).ravel()
+    totals[totals == 0] = 1.0
+    scale = target_sum / totals
+    if sp_mod.issparse(X):
+        sums = (sp_mod.diags(scale) @ X).log1p().sum(axis=0)
+    else:
+        sums = xp.log1p(X * scale[:, None]).sum(axis=0)
+    return to_numpy(xp.asarray(sums)).ravel().astype(np.float64)
+
+
+def genes_in_every_dataset(
+    genes: list[str], batch_genes: dict[str, list[str]], batch_dataset: dict[str, str]
+) -> list[str]:
+    """``genes`` (order kept) present in at least one batch of every dataset.
+
+    Guards ``allow_missing_features=True`` against annotation gaps: a gene
+    with zero counts across a whole dataset (e.g. a gene model missing from
+    that dataset's reference) is more likely absent by construction than
+    biologically.
+    """
+    seen: dict[str, set[str]] = {}
+    for label, gs in batch_genes.items():
+        seen.setdefault(batch_dataset[label], set()).update(gs)
+    return [g for g in genes if all(g in s for s in seen.values())]

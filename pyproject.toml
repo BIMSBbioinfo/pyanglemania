@@ -37,7 +37,7 @@ dependencies = [
     "scipy>=1.11",
     "pandas",
 ]
-version = "0.1.0"
+version = "0.1.1"
 
 [project.optional-dependencies]
 rapids = [ "cupy-cuda12x" ]

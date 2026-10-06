@@ -1,7 +1,7 @@
 # pyanglemania
 ## Introduction
 
-A GPU-ready Python/AnnData port of the R/Bioconductor [anglemania](https://github.com/BIMSBbioinfo/anglemania) package: selects genes whose pairwise correlations stay invariant across batches, for use as integration features (in place of, or alongside, highly-variable genes).
+A GPU-ready Python/AnnData port of the R/Bioconductor [anglemania](https://github.com/BIMSBbioinfo/anglemania) package: selects genes whose correlations to other genes stay invariant across batches, for use as integration features (in place of, or alongside, highly-variable genes). Unlike the R package, which ranks gene *pairs*, every gene gets its own expression-corrected score.
 
 ## Installation
 
@@ -34,7 +34,9 @@ pa.pp.anglemania(adata, batch_key="batch", max_n_genes=2000)
 genes = adata.var_names[adata.var["anglemania_genes"]]
 ```
 
-Selected genes land in `adata.var["anglemania_genes"]` (boolean mask) and `adata.uns["anglemania"]` (parameters, the ranked gene-pair table, and the gene list). On a GPU, move the layer to the device first — e.g. `rapids_singlecell.get.anndata_to_GPU(adata)` — and the same call runs on cupy.
+Selected genes land in `adata.var["anglemania_genes"]` (boolean mask) and `adata.uns["anglemania"]` (parameters, gene universe, and the selected genes, best first). The per-gene scores are in `adata.var["anglemania_*"]`: with `M`/`S` the cross-batch mean/sd of each gene pair's z-scored correlation, `signal = Σⱼ M²`, `noise = Σⱼ S²`, `R = signal / (signal + noise)`, plus their within-expression-bin z-scores `signal_z_binned`/`R_z_binned` and the weighted signal/noise score `WSN = 0.5·signal_z_binned + 0.5·R_z_binned`. Genes are ranked on `score="R"` (`R_z_binned`, the default), `"WSN"`, or `"ICC"` (`ICC_db_z_binned`, see below).
+
+With `allow_missing_features=True`, genes absent from a batch are masked out of that batch (`missing_mode="mask"`, the default) rather than zero-filled as in R (`missing_mode="zero"`). With missing genes `R` is inflated for genes present in fewer batches, so `score="ICC"` (debiased) is the safer selector there. On a GPU, move the layer to the device first — e.g. `rapids_singlecell.get.anndata_to_GPU(adata)` — and the same call runs on cupy.
 
 ## Tutorial
 

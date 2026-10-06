@@ -222,7 +222,7 @@ def _angles_from_moments(col_sum, sum_sq, n_cells: int, method: str, xp):
     with ``cell_chunk_size`` bounding the cell dimension -- this is
     "bottleneck 1"/fix 3 from ``plans/gpu_memory_large_batches.md``, which
     the initial ``factorise_chunked`` implementation didn't carry over from
-    ``_stats.py::finalize()``'s equivalent treatment); this version peaks at
+    the former ``_stats.py::finalize()``'s equivalent treatment); this version peaks at
     3 buffers, mirroring that function's in-place style.
     """
     mean = col_sum / n_cells
