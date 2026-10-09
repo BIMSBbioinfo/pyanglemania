@@ -15,10 +15,9 @@ GPU support is optional and not bundled: `pyanglemania` dispatches to numpy or c
 pip install "pyanglemania[rapids]"   # pulls cupy-cuda12x
 ```
 
-The development environment (including the GPU stack, the tutorial's Harmony/scVI dependencies, and the CUDA headers cupy's JIT needs) is pinned in [`envs/pyanglemania.yml`](envs/pyanglemania.yml):
+For development, install editable from a checkout (plus cupy for the GPU tests, and harmonypy/scvi-tools for the tutorial):
 
 ```bash
-mamba env update -f envs/pyanglemania.yml
 pip install -e . --no-build-isolation
 ```
 
@@ -37,6 +36,21 @@ genes = adata.var_names[adata.var["anglemania_genes"]]
 Selected genes land in `adata.var["anglemania_genes"]` (boolean mask) and `adata.uns["anglemania"]` (parameters, gene universe, and the selected genes, best first). The per-gene scores are in `adata.var["anglemania_*"]`: with `M`/`S` the cross-batch mean/sd of each gene pair's z-scored correlation, `signal = Σⱼ M²`, `noise = Σⱼ S²`, `R = signal / (signal + noise)`, plus their within-expression-bin z-scores `signal_z_binned`/`R_z_binned` and the weighted signal/noise score `WSN = 0.5·signal_z_binned + 0.5·R_z_binned`. Genes are ranked on `score="R"` (`R_z_binned`, the default), `"WSN"`, or `"ICC"` (`ICC_db_z_binned`, see below).
 
 With `allow_missing_features=True`, genes absent from a batch are masked out of that batch (`missing_mode="mask"`, the default) rather than zero-filled as in R (`missing_mode="zero"`). With missing genes `R` is inflated for genes present in fewer batches, so `score="ICC"` (debiased) is the safer selector there. On a GPU, move the layer to the device first — e.g. `rapids_singlecell.get.anndata_to_GPU(adata)` — and the same call runs on cupy.
+
+## How it works
+
+```
+per batch:   counts → normalize → gene×gene correlation ("angles")
+                    → z-score against a permuted null of the same batch
+across batches (streamed, one batch in memory at a time):
+             M_ij, S_ij = weighted mean / sd of each gene pair's z-score
+per gene:    signal = Σⱼ M_ij²,  noise = Σⱼ S_ij²,  R = signal / (signal + noise)
+selection:   z-score within expression bins → rank genes on R_z_binned (or WSN / ICC_db)
+             → top max_n_genes
+```
+
+Gene pairs appear only as an intermediate. Genes are scored and ranked individually, not through a
+ranked list of pairs as in R.
 
 ## Tutorial
 

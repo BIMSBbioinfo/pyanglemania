@@ -4,15 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Since 0.1.1 the selection is gene-level, not pair-level** (see step 4–5 below): R's
-`prefilter_gene_pairs`/`rank_gene_pairs`/`extract_unique_genes` (`_select.py`) and the
-`prefilter_threshold`/`score_weights`/`direction` parameters were removed. The design and the
-experiments behind it live outside this repo, in
+**The selection is gene-level, not pair-level (since 0.1.1).** There is no gene-*pair* ranking,
+prefiltering or weighted pair scoring anywhere in the package any more: R's
+`prefilter_gene_pairs`/`rank_gene_pairs`/`extract_unique_genes` (the old `_select.py`) and the
+`prefilter_threshold`/`score_weights`/`direction` parameters were removed. Every gene gets its own
+row-sum score over all its partners, corrected for expression, and genes are ranked on that directly
+(steps 4–5 below). Anything in `plans/` that talks about pair prefilter/rank/extract stages, SNR
+(`sn_zscore`) ranking or `score_weights` describes the pre-0.1.1 pipeline and is kept only as history.
+The design and the experiments behind the change live outside this repo, in
 `~/projects/CRC1588/dataset_integration/anglemania_analysis/tasks/nmf/docs/tasks/`
 (`pergene_score_into_pyanglemania.md`, `pergene_signal_noise_R_axes.md`,
 `permutation_null_necessity.md`); the package reproduces that task's `gene_scores.py` +
-`add_binned_zscores` (`R_z_binned`, and `score_binned`, called `WSN` here) to float32 precision. Benchmark numbers in
-"Scaling" below that mention the prefilter/rank/extract stages are from before that change.
+`add_binned_zscores` (`R_z_binned`, and `score_binned`, called `WSN` here) to float32 precision.
+
+### Pipeline at a glance
+
+```
+AnnData (raw counts in X or `layer`)
+  │
+  ├─ 1. batch setup        anglemania_batch key, per-dataset weights w_b          (_batches.py)
+  ├─ 2. gene filtering     min_cells_per_gene per batch → intersection, or ≥ min_samples_per_gene
+  │                        batches if allow_missing_features (missing_mode="mask" | "zero")
+  │
+  ├─ 3. per batch b        normalize (CP10K+log1p | residuals | pflog1ppf)          (_angles.py)
+  │                        angles: gene×gene correlation (cosine | spearman | phi_s)
+  │                        null:   same on a permuted matrix → per-gene mean/sd
+  │                        z_b = (angles − null mean_j) / null sd_j,  symmetrised (z + zᵀ)/2
+  │                        └─ folded into running sums, then dropped                (_stats.py)
+  │
+  ├─ 4. cross-batch        M_ij = weighted mean of z_b,  S_ij = weighted sd        (StreamingZscoreStats)
+  │     → per gene         signal_i = Σⱼ M_ij²,  noise_i = Σⱼ S_ij²
+  │                        R_i = signal_i / (signal_i + noise_i)
+  │                        (+ debiased signal_db_i = Σⱼ (M_ij² − κ_ij S_ij²), ICC_db_i)
+  │
+  └─ 5. selection          z-score log10 signal, R, ICC_db within n_bins expression bins
+                           WSN = w₀·signal_z_binned + w₁·R_z_binned                (_gene_level.py)
+                           top max_n_genes by score: "R" (R_z_binned, default) | "WSN" | "ICC"
+                           → adata.var["anglemania_*"], adata.uns["anglemania"]
+```
 
 The core port is implemented and tested on CPU (numpy/scipy). What exists:
 
@@ -49,48 +78,16 @@ If GPU tests start failing on a fresh box, check both of those before assuming a
 
 ### Scaling to large gene panels (tens of thousands of genes)
 
-Benchmarked end-to-end at 20k cells x 20k genes (4 batches) on GPU. Two real findings, both fixed:
+At 20k cells x 20k genes x 4 batches the GPU path was benchmarked before 0.1.1 (191s GPU vs 430s
+CPU end to end), but most of that time was the pair-level prefilter/rank stages that no longer
+exist, so those numbers are obsolete; the per-batch part still holds (per-batch `factorise`, all 4
+batches: ~6s GPU vs ~229s CPU on this sandbox's Tesla P40s). The lesson that carried over: the
+cross-batch reduction must never build several full `(genes x genes)` float64 temporaries at once
+(3.2 GB each at 20k genes). The old `finalize()` did and OOM'd. `StreamingZscoreStats.gene_scores()`
+now works in row chunks (`chunk_size`) and never materialises `M`/`S` as full matrices. No current
+end-to-end benchmark of the gene-level pipeline exists yet.
 
-1. **`StreamingZscoreStats.finalize()` used to OOM** at this scale: the naive chained expression for
-   the weighted variance (`(wz2_sum - wz_sum*wz_sum/w_sum) / denom`, then `sqrt(clip(...))`, then a
-   doubly-nested `xp.where(...)` for the SNR) allocates 8-10 full `(genes x genes)` float64 buffers
-   at once (3.2 GB each at 20k genes) on top of the two accumulators already held. Fixed by rewriting
-   it with in-place ops (`-=`, `/=`, `out=`) and dropping the accumulators once they're no longer
-   needed, which gets this down to ~1-2 extra buffers at any moment — see the comments in `_stats.py`.
-2. **`_select.py::extract_unique_genes` used to dominate total runtime** (8+ of ~14 minutes in the
-   20k x 20k benchmark): it deduplicated the *entire* prefiltered gene-pair table before truncating
-   to `max_n_genes`, via `numpy.unique` on a 100M+-element string array once a permissive
-   `prefilter_threshold` let tens of millions of pairs through (54.5M pairs in that benchmark, out of
-   ~200M possible at 20k genes — unsurprising, since 0.5 isn't a strict z-score cutoff). R's own
-   `extract_rows_for_unique_genes` has the identical cost, so this isn't a Python regression, but
-   it's avoidable: since the table is already rank-sorted, the first `max_n_genes` unique genes are
-   fully determined by some prefix of it. Fixed by growing that prefix exponentially until it has
-   enough, which is a behavior-preserving optimization (see the docstring/tests for why the result is
-   provably identical). This dropped the same 20k x 20k benchmark from 839s to 191s total.
-
-After both fixes, CPU vs GPU at 20k cells x 20k genes x 4 batches (same data, `max_n_genes=2000`,
-default `prefilter_threshold=0.5`; numbers from one run each, not averaged):
-
-| stage | GPU | CPU |
-| --- | --- | --- |
-| gene filtering (`genes_passing_min_cells`, all batches) | 0.1s | 6.2s |
-| per-batch `factorise` (all 4 batches, align+compute+update) | ~6s | ~229s |
-| `finalize` | 0.5s | 15.8s |
-| `prefilter_gene_pairs` (~54.5M of ~200M pairs passed) | 59.5s | 49.2s |
-| `rank_gene_pairs` | 124.5s | 129.2s |
-| `extract_unique_genes` | 0.01s | 0.01s |
-| **total** | **191s** | **430s** (2.25x slower) |
-
-The GPU's advantage is concentrated entirely in the numeric, matmul/elementwise-heavy steps
-(`factorise`, `finalize`: 30-38x faster on this sandbox's Tesla P40s) — `prefilter_gene_pairs` and
-`rank_gene_pairs` run on CPU/numpy/pandas regardless of which backend `adata.X` uses (`_select.py`
-calls `to_numpy()` immediately), so they cost the same either way and are why the *overall* speedup
-is a more modest ~2.25x rather than 30x+. Porting the prefilter/rank step to stay on-GPU (e.g. via
-cudf, or filtering before transferring off-device) would be the next lever for end-to-end speed at
-large gene-panel scale, but hasn't been done. Raising `prefilter_threshold` is the user-facing lever
-to cut the prefilter/rank cost down on very large gene panels in the meantime.
-
-The benchmark above is still bounded by whole-batch materialization (`align_to_common_genes` +
+The per-batch step is bounded by whole-batch materialization (`align_to_common_genes` +
 `factorise` each hold the full `(cells x genes)` matrix, several copies at once, for one batch at a
 time). That becomes its own OOM risk independent of total gene-panel size when a *single batch* is
 very large (tens of thousands of cells) — see `plans/gpu_memory_large_batches.md` (triggered by a
@@ -101,7 +98,7 @@ oversized batch in row-chunks instead of all at once (`_angles.py::factorise_chu
 `method in ("cosine", "phi_s")` / `normalization_method in ("divide_by_total_counts", "pflog1ppf")`
 / `permute_row_or_column="column"` combination (raises `ValueError` for anything else rather than
 silently ignoring the chunk size). Both default off/unused unless a batch is actually too large to
-fit, so the benchmark above is unaffected.
+fit, so the default path is unaffected.
 
 ## Development commands
 
@@ -143,9 +140,12 @@ Read `anglemania.R`, `compute_angles.R`, `stats.R`, `select_genes.R`, `prepare_a
    - Normalize both the real and permuted matrices (`normalize_matrix`: default `"divide_by_total_counts"` = CP10K + log1p; alternate `"find_residuals"` regresses out log total counts per gene. Note R's docs also mention a third choice, `"scale_by_total_counts"`, but R's own `normalize_matrix` never implements it — only these two are ported from R as-is. A third, non-R choice, `"pflog1ppf"`, was added later — see "Extensions beyond the R port" below).
    - Gene-gene relationship matrix for both (`extract_angles`: Pearson correlation across cells, i.e. the "angle" between mean-centered gene vectors; `"spearman"` ranks first — ties broken by original order rather than R's tie-averaging, to keep this vectorized on both numpy and cupy). Diagonal is NaN. A third, non-R `method`, `"phi_s"`, was added later — see below.
    - Per-gene (per-column) `mean`/`sd` of the **permuted** matrix (`get_dstat`), then z-score the **real** matrix against that null. This makes the z-score matrix asymmetric (entry `(i, j)` is standardized against gene `j`'s own null, not gene `i`'s) — intentional, matches R, and only the upper triangle is read downstream anyway.
-4. **Cross-batch reduction** (`stats.R::get_list_stats` → `_stats.py::StreamingZscoreStats`) — **no longer R's output**, see below. Originally: weighted `mean_zscore`, weighted `sds_zscore`, and `sn_zscore = |mean| / sd` per gene pair, accumulated batch-by-batch instead of from a list of all batches' matrices (the core streaming deviation; see the module docstring for the single-pass identity this relies on).
-   Now: each per-batch z matrix is symmetrised (`(z + zᵀ)/2`) on the way in, then reduced to one
-   row per gene (`gene_scores()`, row-chunked, never materialising `M`/`S`): `signal = Σⱼ M_ij²`,
+4. **Cross-batch reduction** (`stats.R::get_list_stats` → `_stats.py::StreamingZscoreStats`). The
+   weighted cross-batch mean `M` and sd `S` per gene pair are accumulated batch-by-batch instead of
+   from a list of all batches' matrices (the core streaming deviation; see the module docstring for
+   the single-pass identity this relies on). Unlike R, these pair-level `M`/`S` are only an
+   intermediate and are never ranked or returned (R's `sn_zscore = |mean|/sd` pair SNR is gone). Each
+   per-batch z matrix is symmetrised (`(z + zᵀ)/2`) on the way in, then reduced to one row per gene (`gene_scores()`, row-chunked, never materialising `M`/`S`): `signal = Σⱼ M_ij²`,
    `noise = Σⱼ S_ij²`, `R = signal / (signal + noise)`. With `allow_missing_features=True` a pair
    only uses the batches where both genes are present (per-pair weights `W1 = Pᵀ diag(w) P` from the
    per-batch presence vectors, not accumulated); row sums are rescaled by `(p−1)/n_valid`. With
@@ -197,10 +197,10 @@ two additions only):
   matrix φs operates on is the shifted-CLR transform, not raw counts.
 
 Both compose with the rest of the pipeline (permutation, per-batch z-scoring, cross-batch streaming
-reduction, prefilter/rank/select) unmodified, since they preserve the existing function contracts:
+reduction, gene-level scoring/selection) unmodified, since they preserve the existing function contracts:
 `normalize_matrix` still returns a `(cells x genes)` array, `extract_angles` still returns a
-symmetric `(genes x genes)` array with NaN diagonal. No changes were needed to the
-cross-batch reduction or selection. Tested for CPU/GPU parity the same way as the R-ported choices (`tests/test_angles.py`,
+symmetric `(genes x genes)` array with NaN diagonal. No changes were needed downstream
+of `factorise`. Tested for CPU/GPU parity the same way as the R-ported choices (`tests/test_angles.py`,
 `tests/test_gpu.py`).
 
 ## Architecture
